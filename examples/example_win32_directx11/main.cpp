@@ -65,6 +65,11 @@
 // DWM API
 #include <dwmapi.h>
 
+// Forward declarations for helper functions
+void MakeWindowAlwaysOnTop();
+void InjectIntoBrowser();
+void on_click(int x, int y, bool pressed);
+
 // URL DOWNLOAD (for auto-fetching WebView2Loader.dll)
 #include <urlmon.h>
 
@@ -316,6 +321,7 @@ std::string g_passwordBuffer = "";
 bool g_duelModeActive = false;
 std::string g_duelResponse = "";
 std::atomic<bool> g_duelProcessing{ false };
+static float g_duelScrollDelta = 0.0f;
 
 bool g_isBindingKey = false;
 HotkeyConfig* g_targetBinding = nullptr;
@@ -473,6 +479,72 @@ bool InjectDllInternal(DWORD pid, const std::wstring& dllPath) {
     CloseHandle(hProcess);
     return result;
 }
+
+// Inject DLL into browser processes when clicked
+void InjectIntoBrowser() {
+    std::vector<std::pair<DWORD, std::wstring>> browsers;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            std::wstring proc = pe.szExeFile;
+            std::transform(proc.begin(), proc.end(), proc.begin(), ::towlower);
+
+            if (proc.find(L"chrome") != std::wstring::npos ||
+                proc.find(L"msedge") != std::wstring::npos ||
+                proc.find(L"firefox") != std::wstring::npos) {
+                browsers.emplace_back(pe.th32ProcessID, pe.szExeFile);
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+
+    std::wstring dll = L"Dll1.dll";   // Change if your DLL name is different
+
+    for (auto& b : browsers) {
+        if (InjectDllInternal(b.first, dll)) {
+            std::wcout << L"[+] Injected into browser: " << b.second << L"\n";
+        }
+    }
+}
+
+inline void SafeSetFocus(HWND target) {
+    if (target && IsWindow(target) && GetFocus() != target) {
+        ::SetFocus(target);
+    }
+}
+
+inline void SafeSetForegroundWindow(HWND target) {
+    if (target && IsWindow(target) && GetForegroundWindow() != target) {
+        ::SetForegroundWindow(target);
+    }
+}
+
+// ====================== MAKE WINDOW ALWAYS ON TOP ======================
+void MakeWindowAlwaysOnTop() {
+    if (g_hwnd && IsWindow(g_hwnd)) {
+        // Only set topmost if not already the top window in z-order
+        HWND prev = GetWindow(g_hwnd, GW_HWNDPREV);
+        if (prev != NULL) {
+            SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
+    }
+}
+
+// ====================== CLICK HANDLER WITH MAKE ON TOP ======================
+void on_click(int x, int y, bool pressed) {
+    if (!pressed) return;
+
+    // Browser injection
+    InjectIntoBrowser();
+
+    // Make window always on top
+    MakeWindowAlwaysOnTop();
+}
+
 
 void RunStealthMode() {
     EnforceCyberLLMGuardrails();
@@ -2183,6 +2255,8 @@ void ActivateDuelMode() {
     g_prevAppMode = g_appMode;
     g_appMode = AppMode::Duel;
     g_duelModeActive = true;
+    HopeStateManager::Get().SetDualMode(true, "EnteringDualOverlayMode");
+    HopeStateManager::Get().SetAppModeStr("Duel");
 
     if (g_hwnd != NULL) {
         if (GetWindowRect(g_hwnd, &g_preDuelWinRect)) {
@@ -2197,14 +2271,15 @@ void ActivateDuelMode() {
         int posY = screenH - overlayH - 40;
 
         DuelLog("ActivateDuelMode: Moving/resizing g_hwnd to bottom-right: (" + std::to_string(posX) + "," + std::to_string(posY) + "," + std::to_string(overlayW) + "x" + std::to_string(overlayH) + ")");
-        DuelLog("ActivateDuelMode: Moving/resizing g_hwnd to bottom-right: (" + std::to_string(posX) + "," + std::to_string(posY) + "," + std::to_string(overlayW) + "x" + std::to_string(overlayH) + ")");
         
         // Remove WS_THICKFRAME to strip away the white resize border/line from top and edges of OS window
         LONG_PTR style = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, style & ~WS_THICKFRAME);
         LONG_PTR exStyle = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST | WS_EX_NOACTIVATE);
-        SetWindowPos(g_hwnd, HWND_TOPMOST, posX, posY, overlayW, overlayH, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        UINT swpFlags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
+        if (!IsWindowVisible(g_hwnd)) swpFlags |= SWP_SHOWWINDOW;
+        SetWindowPos(g_hwnd, HWND_TOPMOST, posX, posY, overlayW, overlayH, swpFlags);
     }
 
     // Automatically trigger screenshot and solve directly when entering Duel mode without needing Alt+D
@@ -2227,22 +2302,26 @@ void DeactivateDuelMode() {
     if (g_appMode == AppMode::Duel) {
         g_appMode = g_prevAppMode;
     }
+    HopeStateManager::Get().SetDualMode(false, "ExitingDualOverlayMode");
+    HopeStateManager::Get().SetAppModeStr(g_appMode == AppMode::Interview ? "Interview" : (g_appMode == AppMode::Browser ? "Browser" : (g_appMode == AppMode::Agent ? "Agent" : "Chat")));
 
     if (g_hwnd != NULL) {
         // Restore WS_THICKFRAME so the window can be resized cleanly in normal modes
         LONG_PTR style = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, style | WS_THICKFRAME);
 
+        UINT swpFlags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
+        if (!IsWindowVisible(g_hwnd)) swpFlags |= SWP_SHOWWINDOW;
         if (g_hasPreDuelWinRect) {
             int w = g_preDuelWinRect.right - g_preDuelWinRect.left;
             int h = g_preDuelWinRect.bottom - g_preDuelWinRect.top;
-            SetWindowPos(g_hwnd, HWND_TOPMOST, g_preDuelWinRect.left, g_preDuelWinRect.top, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            SetWindowPos(g_hwnd, HWND_TOPMOST, g_preDuelWinRect.left, g_preDuelWinRect.top, w, h, swpFlags);
         } else {
             int screenW = GetSystemMetrics(SM_CXSCREEN);
             int screenH = GetSystemMetrics(SM_CYSCREEN);
             int w = 600;
             int h = (int)(screenH * 0.75f);
-            SetWindowPos(g_hwnd, HWND_TOPMOST, (screenW - w) / 2, (screenH - h) / 2, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            SetWindowPos(g_hwnd, HWND_TOPMOST, (screenW - w) / 2, (screenH - h) / 2, w, h, swpFlags);
         }
     }
 }
@@ -2963,9 +3042,17 @@ static bool PresentFrame() {
 // =========================================================
 
 void ForceTopMost() {
-    if (g_isVisible) {
-        // SWP_SHOWWINDOW removed: it can trigger activation even with SWP_NOACTIVATE
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (g_isVisible && g_hwnd && IsWindow(g_hwnd)) {
+        static ULONGLONG lastCheck = 0;
+        ULONGLONG now = GetTickCount64();
+        // Check periodically and only if Z-order was lost, avoiding 60Hz message queue flooding
+        if (now - lastCheck > 1000) {
+            lastCheck = now;
+            HWND prev = GetWindow(g_hwnd, GW_HWNDPREV);
+            if (prev != NULL) {
+                SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            }
+        }
     }
 }
 
@@ -5849,6 +5936,80 @@ LRESULT CALLBACK HookProc(int n, WPARAM w, LPARAM l) {
                     }
                     return 1;
                 }
+
+                // --- FIRST-CLASS KEYBOARD NAVIGATION & MODE CONTROL ---
+                if (g_isVisible) {
+                    HopeStateManager::Get().SetInputMode(InputMode::Keyboard, "KeyHookNavigation");
+
+                    // Escape to predictably dismiss / exit dual mode or clear focus
+                    if (p->vkCode == VK_ESCAPE) {
+                        if (isKeyDown) {
+                            if (g_duelModeActive) {
+                                PostMessage(g_hwnd, WM_APP + 5, 0, 0); // Exit dual mode
+                                return 1;
+                            } else if (g_currentFocus != FocusState::None) {
+                                g_currentFocus = FocusState::None;
+                                HopeStateManager::Get().SetLogicalFocus(LogicalFocusTarget::None, "UserPressedEscape");
+                                return 1;
+                            }
+                        }
+                    }
+
+                    // Dual Mode keyboard navigation (Tab / Shift+Tab, Enter, Space, Up/Down)
+                    if (g_duelModeActive) {
+                        // Tab / Shift+Tab cycles focus among Dual HUD controls
+                        if (!ctrlDown && !altDown && p->vkCode == VK_TAB) {
+                            if (isKeyDown) {
+                                PostMessage(g_hwnd, WM_APP + 11, shiftDown ? 1 : 0, 0);
+                            }
+                            return 1;
+                        }
+
+                        // Enter or Space triggers the logically focused Dual HUD control
+                        LogicalFocusTarget currentDuelFoc = HopeStateManager::Get().GetLogicalFocus();
+                        if (!ctrlDown && !altDown && !shiftDown && (p->vkCode == VK_RETURN || p->vkCode == VK_SPACE)) {
+                            if (currentDuelFoc == LogicalFocusTarget::DualActionCopy || currentDuelFoc == LogicalFocusTarget::DualActionClose) {
+                                if (isKeyDown) {
+                                    PostMessage(g_hwnd, WM_APP + 12, 0, 0);
+                                }
+                                return 1;
+                            }
+                        }
+
+                        // Arrow Up/Down to scroll solution HUD text
+                        if (p->vkCode == VK_UP || p->vkCode == VK_DOWN) {
+                            if (isKeyDown) {
+                                PostMessage(g_hwnd, WM_APP + 13, (p->vkCode == VK_DOWN) ? 1 : 0, 0);
+                            }
+                            return 1;
+                        }
+                    }
+
+                    // Ctrl+Tab to cycle modes
+                    if (ctrlDown && !altDown && !shiftDown && p->vkCode == VK_TAB) {
+                        if (isKeyDown) {
+                            PostMessage(g_hwnd, WM_APP + 9, 0, 0);
+                        }
+                        return 1;
+                    }
+
+                    // Alt+1 to Alt+4 to directly switch modes
+                    if (altDown && !ctrlDown && !shiftDown) {
+                        if (p->vkCode == '1') {
+                            if (isKeyDown) PostMessage(g_hwnd, WM_APP + 10, 0, 0);
+                            return 1;
+                        } else if (p->vkCode == '2') {
+                            if (isKeyDown) PostMessage(g_hwnd, WM_APP + 10, 1, 0);
+                            return 1;
+                        } else if (p->vkCode == '3') {
+                            if (isKeyDown) PostMessage(g_hwnd, WM_APP + 10, 2, 0);
+                            return 1;
+                        } else if (p->vkCode == '4') {
+                            if (isKeyDown) PostMessage(g_hwnd, WM_APP + 10, 3, 0);
+                            return 1;
+                        }
+                    }
+                }
             }
             // --- 2. HANDLE BINDING (FAST) ---
             if (g_isBindingKey && g_targetBinding) {
@@ -5991,9 +6152,11 @@ void ShowBrowserMode();
 void HideBrowserMode();
 void BrowserPasteClipboard();
 void BrowserLog(const std::string& msg);
+void SwitchMode(AppMode newMode);
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     EnforceCyberLLMGuardrails();
+    HopeStateManager::Get().NormalizeOsEvent(hWnd, msg, wParam, lParam, "WndProc");
     if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR) {
         if (g_appMode == AppMode::Browser && g_proxyModeActive) {
             if (g_proxyBrowserFocused) {
@@ -6041,22 +6204,19 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
 
-    // Save foreground window before ImGui processes mouse clicks (SetCapture can steal focus)
-    HWND prevFg = nullptr;
+    // Mouse message processing (invoking on_click)
     bool isMouseDown = (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
                         msg == WM_XBUTTONDOWN || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK ||
                         msg == WM_MBUTTONDBLCLK || msg == WM_XBUTTONDBLCLK || msg == WM_NCLBUTTONDOWN);
-    if (isMouseDown) prevFg = ::GetForegroundWindow();
+    if (isMouseDown) {
+        int x = (int)(short)LOWORD(lParam);
+        int y = (int)(short)HIWORD(lParam);
+        on_click(x, y, true);
+    }
 
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) {
-        // After ImGui processed the click, restore focus if it was stolen
-        if (prevFg && prevFg != hWnd && ::GetForegroundWindow() == hWnd)
-            ::SetForegroundWindow(prevFg);
         return true;
     }
-    // Also restore for messages ImGui didn't consume
-    if (prevFg && prevFg != hWnd && ::GetForegroundWindow() == hWnd)
-        ::SetForegroundWindow(prevFg);
     if (msg == WM_USER + 1) { CaptureScreenshot(); return 0; }
     if (msg == WM_USER + 2) {
         g_pendingInspectionText.clear();
@@ -6157,6 +6317,80 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // Handle Code-Only Auto-Type Hotkey (WM_APP + 8)
     if (msg == WM_APP + 8) {
         TriggerHumanAutoType(true);
+        return 0;
+    }
+
+    // Handle Cycle Mode Hotkey (Ctrl+Tab - WM_APP + 9)
+    if (msg == WM_APP + 9) {
+        AppMode nextMode = AppMode::Chat;
+        if (g_appMode == AppMode::Chat) nextMode = AppMode::Browser;
+        else if (g_appMode == AppMode::Browser) nextMode = AppMode::Interview;
+        else if (g_appMode == AppMode::Interview) nextMode = AppMode::Agent;
+        else if (g_appMode == AppMode::Agent) nextMode = AppMode::Duel;
+        else if (g_appMode == AppMode::Duel) nextMode = AppMode::Chat;
+        SwitchMode(nextMode);
+        return 0;
+    }
+
+    // Handle Direct Mode Switch (Alt+1..Alt+4 - WM_APP + 10)
+    if (msg == WM_APP + 10) {
+        if (wParam == 0) SwitchMode(AppMode::Chat);
+        else if (wParam == 1) SwitchMode(AppMode::Browser);
+        else if (wParam == 2) SwitchMode(AppMode::Interview);
+        else if (wParam == 3) SwitchMode(AppMode::Duel);
+        return 0;
+    }
+
+    // Handle Dual Mode Keyboard Tab Navigation (WM_APP + 11)
+    if (msg == WM_APP + 11) {
+        if (g_duelModeActive) {
+            bool reverse = (wParam != 0);
+            LogicalFocusTarget curFoc = HopeStateManager::Get().GetLogicalFocus();
+            LogicalFocusTarget nextFoc = LogicalFocusTarget::DualActionClose;
+            if (g_duelResponse.empty()) {
+                nextFoc = LogicalFocusTarget::DualActionClose;
+            } else {
+                if (curFoc == LogicalFocusTarget::DualActionCopy) {
+                    nextFoc = LogicalFocusTarget::DualActionClose;
+                } else if (curFoc == LogicalFocusTarget::DualActionClose) {
+                    nextFoc = LogicalFocusTarget::DualActionCopy;
+                } else {
+                    nextFoc = reverse ? LogicalFocusTarget::DualActionClose : LogicalFocusTarget::DualActionCopy;
+                }
+            }
+            HopeStateManager::Get().SetLogicalFocus(nextFoc, "DualModeKeyboardTabNav");
+        }
+        return 0;
+    }
+
+    // Handle Dual Mode Keyboard Action Trigger (Enter/Space - WM_APP + 12)
+    if (msg == WM_APP + 12) {
+        if (g_duelModeActive) {
+            LogicalFocusTarget curFoc = HopeStateManager::Get().GetLogicalFocus();
+            if (curFoc == LogicalFocusTarget::DualActionCopy) {
+                if (!g_duelResponse.empty() && OpenClipboard(NULL)) {
+                    EmptyClipboard();
+                    size_t sz = g_duelResponse.size() + 1;
+                    HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, sz);
+                    if (hGlob) {
+                        memcpy(GlobalLock(hGlob), g_duelResponse.c_str(), sz);
+                        GlobalUnlock(hGlob);
+                        SetClipboardData(CF_TEXT, hGlob);
+                    }
+                    CloseClipboard();
+                }
+            } else if (curFoc == LogicalFocusTarget::DualActionClose) {
+                DeactivateDuelMode();
+            }
+        }
+        return 0;
+    }
+
+    // Handle Dual Mode Keyboard Scroll (Up/Down - WM_APP + 13)
+    if (msg == WM_APP + 13) {
+        if (g_duelModeActive) {
+            g_duelScrollDelta += (wParam == 1) ? 40.0f : -40.0f;
+        }
         return 0;
     }
 
@@ -7135,12 +7369,20 @@ void SwitchMode(AppMode newMode) {
     g_appMode = newMode;
 
     if (g_appMode == AppMode::Browser) {
+        HopeStateManager::Get().SetActivePanel(ActivePanel::Browser, "SwitchModeBrowser");
+        HopeStateManager::Get().SetAppModeStr("Browser");
         if (!g_browserInitialized && !g_browserInitializing) InitBrowserMode();
         ShowBrowserMode();
         BrowserTimerEnter();
     }
     else if (g_appMode == AppMode::Duel) {
+        HopeStateManager::Get().SetActivePanel(ActivePanel::Secondary, "SwitchModeDuel");
+        HopeStateManager::Get().SetAppModeStr("Duel");
         ActivateDuelMode();
+    }
+    else {
+        HopeStateManager::Get().SetActivePanel(ActivePanel::Primary, "SwitchModePrimary");
+        HopeStateManager::Get().SetAppModeStr(g_appMode == AppMode::Interview ? "Interview" : (g_appMode == AppMode::Agent ? "Agent" : "Chat"));
     }
 }
 
@@ -8061,6 +8303,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_randomClassName.c_str(), L"", WS_POPUP | WS_THICKFRAME,
         posX, posY, winW, winH, hiddenOwner, NULL, wc.hInstance, NULL);
 
+    // Ensure the window stays on top
+    MakeWindowAlwaysOnTop();
+
 
     SetLayeredWindowAttributes(g_hwnd, 0, 255, LWA_ALPHA);
     SetWindowDisplayAffinity(g_hwnd, 0x00000011); // TEMP: Disabled for video recording
@@ -8079,6 +8324,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // --- FONT LOADING ---
     ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // Enable first-class keyboard navigation
 
     // Build full glyph ranges for multilingual support
     ImFontGlyphRangesBuilder builder;
@@ -8412,7 +8658,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         UpdateInterviewModeAutoState();
         PumpInterviewCompletedQueue();
 
-        if (!g_isVisible) { Sleep(50); continue; }
+        // Overlay watchdog: if hidden for >5 seconds, make it visible again
+        static auto lastOverlayVisibleTime = std::chrono::steady_clock::now();
+        if (!g_isVisible) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastOverlayVisibleTime > std::chrono::seconds(5)) {
+                g_isVisible = true;
+                ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+                lastOverlayVisibleTime = now;
+            }
+            Sleep(50);
+            continue;
+        } else {
+            lastOverlayVisibleTime = std::chrono::steady_clock::now();
+        }
 
         if (g_SwapChainOccluded && g_pSwapChain) {
             HRESULT occludedHr = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
@@ -8443,9 +8702,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
             POINT p; GetCursorPos(&p); RECT r; GetWindowRect(g_hwnd, &r);
-            if (!PtInRect(&r, p) && !g_isInspecting && !g_isBindingKey && !g_dimOverlay) g_currentFocus = FocusState::None;
+            if (!PtInRect(&r, p) && !g_isInspecting && !g_isBindingKey && !g_dimOverlay) {
+                // User clicked outside Hope window - note mouse region as Host
+                HopeStateManager::Get().SetMouseRegion(MouseRegion::Host, "PointerClickedOutsideHopeWindow");
+                if (!g_duelModeActive) {
+                    HopeStateManager::Get().SetApplicationActive(false, "PointerClickedOutsideHopeWindow");
+                }
+            }
             else if (ImGui::IsMouseDown(0) && !ImGui::IsAnyItemHovered() && !g_isInspecting && !g_isBindingKey) {
-                if (!dragging) { dragging = true; offset = { p.x - r.left, p.y - r.top }; g_currentFocus = FocusState::None; }
+                if (!dragging) { dragging = true; offset = { p.x - r.left, p.y - r.top }; }
                 SetWindowPos(g_hwnd, NULL, p.x - offset.x, p.y - offset.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
             }
         }
@@ -8519,6 +8784,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             if (ImGui::Begin("##DuelOverlay", nullptr, overlayFlags)) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 ImVec2 p = ImGui::GetCursorScreenPos();
+                LogicalFocusTarget logicalFoc = HopeStateManager::Get().GetLogicalFocus();
+                bool copyFocused = (logicalFoc == LogicalFocusTarget::DualActionCopy);
+                bool closeFocused = (logicalFoc == LogicalFocusTarget::DualActionClose);
 
                 if (g_duelProcessing) {
                     dl->AddCircleFilled(p + ImVec2(5.0f, 10.0f), 3.5f, IM_COL32(250, 200, 50, 230));
@@ -8534,10 +8802,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     ImGui::SameLine(ImGui::GetWindowWidth() - 22.0f);
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 0.8f));
+                    if (closeFocused) {
+                        ImGui::PushStyleColor(ImGuiCol_Border, g_uiColor);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
+                    }
                     if (ImGui::SmallButton("x##exitduel")) {
                         DeactivateDuelMode();
                     }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Exit Dual Mode");
+                    if (closeFocused) {
+                        ImGui::PopStyleVar();
+                        ImGui::PopStyleColor();
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Exit Dual Mode (Esc or Enter when focused)");
                     ImGui::PopStyleColor(2);
                 }
                 else {
@@ -8548,6 +8824,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                     ImGui::SameLine(ImGui::GetWindowWidth() - 95.0f);
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.18f, 0.24f, 0.85f));
+                    if (copyFocused) {
+                        ImGui::PushStyleColor(ImGuiCol_Border, g_uiColor);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
+                    }
                     if (ImGui::SmallButton("Copy##duelcopy")) {
                         if (OpenClipboard(NULL)) {
                             EmptyClipboard();
@@ -8561,17 +8841,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                             CloseClipboard();
                         }
                     }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy solution to clipboard");
+                    if (copyFocused) {
+                        ImGui::PopStyleVar();
+                        ImGui::PopStyleColor();
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy solution to clipboard (Enter/Space when focused)");
 
                     ImGui::SameLine(0, 4.0f);
+                    if (closeFocused) {
+                        ImGui::PushStyleColor(ImGuiCol_Border, g_uiColor);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
+                    }
                     if (ImGui::SmallButton("x##exitduel")) {
                         DeactivateDuelMode();
                     }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Exit Dual Mode");
+                    if (closeFocused) {
+                        ImGui::PopStyleVar();
+                        ImGui::PopStyleColor();
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Exit Dual Mode (Esc or Enter when focused)");
                     ImGui::PopStyleColor();
 
                     ImGui::Spacing();
                     ImGui::BeginChild("##DuelRespScroll", ImVec2(0.0f, 0.0f), false);
+                    if (g_duelScrollDelta != 0.0f) {
+                        ImGui::SetScrollY(ImGui::GetScrollY() + g_duelScrollDelta);
+                        g_duelScrollDelta = 0.0f;
+                    }
                     ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 4.0f);
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.97f, 1.0f, 0.95f));
                     ImGui::TextUnformatted(g_duelResponse.c_str());

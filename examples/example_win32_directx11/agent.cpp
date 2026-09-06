@@ -2235,12 +2235,13 @@ private:
 
         auto ForceFG = [](HWND hwnd) {
             if (!hwnd || !IsWindow(hwnd)) return;
+            if (GetForegroundWindow() == hwnd && GetFocus() == hwnd) return;
             DWORD targetTid = GetWindowThreadProcessId(hwnd, NULL);
             DWORD curTid = GetCurrentThreadId();
             if (targetTid != curTid) AttachThreadInput(curTid, targetTid, TRUE);
-            BringWindowToTop(hwnd);
-            SetForegroundWindow(hwnd);
-            SetFocus(hwnd);
+            if (GetWindow(hwnd, GW_HWNDPREV) != NULL) BringWindowToTop(hwnd);
+            if (GetForegroundWindow() != hwnd) SetForegroundWindow(hwnd);
+            if (GetFocus() != hwnd) SetFocus(hwnd);
             if (targetTid != curTid) AttachThreadInput(curTid, targetTid, FALSE);
             Sleep(60);
         };
@@ -2338,12 +2339,13 @@ private:
     bool ExecuteAction(const AgentAction& action) {
         auto ForceForeground = [](HWND hwnd) {
             if (!hwnd || !IsWindow(hwnd)) return;
+            if (GetForegroundWindow() == hwnd && GetFocus() == hwnd) return;
             DWORD targetTid = GetWindowThreadProcessId(hwnd, NULL);
             DWORD curTid = GetCurrentThreadId();
             if (targetTid != curTid) AttachThreadInput(curTid, targetTid, TRUE);
-            BringWindowToTop(hwnd);
-            SetForegroundWindow(hwnd);
-            SetFocus(hwnd);
+            if (GetWindow(hwnd, GW_HWNDPREV) != NULL) BringWindowToTop(hwnd);
+            if (GetForegroundWindow() != hwnd) SetForegroundWindow(hwnd);
+            if (GetFocus() != hwnd) SetFocus(hwnd);
             if (targetTid != curTid) AttachThreadInput(curTid, targetTid, FALSE);
             Sleep(60);
         };

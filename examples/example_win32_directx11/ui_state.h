@@ -16,13 +16,20 @@ extern FocusState g_currentFocus;
 extern std::string g_chatBuffer;
 
 // ============================================================================
-// STEP 2: NORMALIZED APPLICATION STATE MODEL
+// DECOUPLED APPLICATION STATE MODEL
 // ============================================================================
 
 // High-level interaction state: Is the user currently engaging Hope?
+// Separated from physical mouse position and mouse hover events.
 enum class InteractionState {
     Inactive,  // Hope is passive/idle; host applications retain input priority
-    Active     // Hope is actively engaged by the user (via deliberate hotkey or focus)
+    Active     // Hope is actively engaged by the user (via deliberate hotkey, typing, or click)
+};
+
+// Window activation state as reported by OS window manager
+enum class WindowActivationState {
+    Inactive,
+    Active
 };
 
 // Input modality: How is the user interacting with Hope?
@@ -38,12 +45,21 @@ enum class WindowRole {
     Host       // External target window (Window A, e.g. browser)
 };
 
-// Region / panel under interaction
+// Region / panel under interaction inside Hope
 enum class ActivePanel {
     None,
     Primary,   // Main Hope window / normal mode UI
     Secondary, // Dual mode HUD / floating pill
     Browser    // Embedded WebView2 viewport
+};
+
+// Mouse-over location: Which physical region is the mouse hovering over?
+// Changing MouseRegion does NOT automatically change application active state!
+enum class MouseRegion {
+    None,
+    Host,      // External host window (e.g. browser page)
+    Primary,   // Hope main window region
+    Secondary  // Hope dual mode HUD / pill overlay
 };
 
 // Logical UI focus target inside Hope
@@ -71,17 +87,22 @@ enum class LogicalFocusTarget {
 };
 
 // ============================================================================
-// STEP 2 & 7: HOPE STATE MANAGER WITH IDEMPOTENT EVENT NORMALIZATION
+// HOPE STATE MANAGER WITH IDEMPOTENT EVENT NORMALIZATION & DECOUPLED STATE
 // ============================================================================
 
 class HopeStateManager {
 private:
     std::mutex m_mutex;
     InteractionState m_interactionState = InteractionState::Inactive;
-    InputMode m_inputMode = InputMode::Mouse;
+    WindowActivationState m_windowActivation = WindowActivationState::Inactive;
+    MouseRegion m_mouseRegion = MouseRegion::None;
     ActivePanel m_activePanel = ActivePanel::Primary;
     LogicalFocusTarget m_logicalFocus = LogicalFocusTarget::None;
     WindowRole m_currentWindowRole = WindowRole::Primary;
+    InputMode m_inputMode = InputMode::Mouse;
+    HWND m_focusedHwnd = NULL;
+    bool m_dualMode = false;
+    bool m_isVisible = false;
     std::string m_appModeStr = "Chat";
 
     bool m_logInitialized = false;
@@ -144,6 +165,15 @@ private:
         }
     }
 
+    const char* MouseRegionToStr(MouseRegion m) {
+        switch (m) {
+            case MouseRegion::Host: return "Host";
+            case MouseRegion::Primary: return "Primary";
+            case MouseRegion::Secondary: return "Secondary";
+            default: return "None";
+        }
+    }
+
     const char* TargetToStr(LogicalFocusTarget t) {
         switch (t) {
             case LogicalFocusTarget::ChatInput: return "ChatInput";
@@ -169,30 +199,21 @@ private:
         }
     }
 
-public:
-    static HopeStateManager& Get() {
-        static HopeStateManager instance;
-        return instance;
-    }
-
-    // STEP 8: Structured Debug Logging conforming to specification:
-    // [TIMESTAMP]
-    // EVENT=...
-    // WINDOW=...
-    // STATE=...
-    // ACTION=...
-    // REASON=...
-    void LogTransition(const char* eventSource, const char* eventType, const char* windowRole,
-                       const char* prevState, const char* newState,
-                       const char* currentMode, const char* currentPanel,
-                       const char* action, const char* reason) {
+    void LogTransitionInternal(const char* eventSource, const char* eventType, HWND hwnd,
+                               const char* prevState, const char* newState,
+                               const char* prevRegion, const char* currentRegion,
+                               const char* keyboardFocus, const char* mouseRegion,
+                               const char* action, const char* reason) {
         std::string ts = GetCurrentTimestampStr();
         std::ostringstream oss;
         oss << "[" << ts << "]\n"
             << "EVENT=" << (eventType ? eventType : "UNKNOWN") << "\n"
-            << "WINDOW=" << (windowRole ? windowRole : "PRIMARY") << "\n"
-            << "STATE=" << (newState ? newState : "Inactive") << "\n"
-            << "ACTION=" << (action ? action : "NoStateChange") << "\n"
+            << "HWND=" << WindowRoleToStr(m_currentWindowRole) << " (0x" << std::hex << (uintptr_t)hwnd << std::dec << ")\n"
+            << "ApplicationActive=" << (newState ? newState : "Inactive") << " (Previous=" << (prevState ? prevState : "Inactive") << ")\n"
+            << "CurrentRegion=" << (currentRegion ? currentRegion : "None") << " (Previous=" << (prevRegion ? prevRegion : "None") << ")\n"
+            << "MouseRegion=" << (mouseRegion ? mouseRegion : "None") << "\n"
+            << "KeyboardFocus=" << (keyboardFocus ? keyboardFocus : "None") << "\n"
+            << "Action=" << (action ? action : "NoStateChange") << "\n"
             << "REASON=" << (reason ? reason : "NormalOperation") << "\n\n";
 
         std::string logEntry = oss.str();
@@ -209,29 +230,80 @@ public:
         }
     }
 
-    // Idempotent state setter
+public:
+    static HopeStateManager& Get() {
+        static HopeStateManager instance;
+        return instance;
+    }
+
+    // Diagnostic logging helper conforming to specification
+    void LogTransition(const char* eventSource, const char* eventType, const char* windowRole,
+                       const char* prevState, const char* newState,
+                       const char* currentMode, const char* currentPanel,
+                       const char* action, const char* reason) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        LogTransitionInternal(eventSource, eventType, m_focusedHwnd,
+                              prevState, newState,
+                              currentPanel, currentPanel,
+                              TargetToStr(m_logicalFocus),
+                              MouseRegionToStr(m_mouseRegion),
+                              action, reason);
+    }
+
+    // Idempotent application active state setter
+    // Crucially: Only called upon deliberate user engagement (hotkeys, text entry, clicks)
+    // NEVER automatically toggled by mouse hover!
+    bool SetApplicationActive(bool active, const char* reason = nullptr, const char* eventSource = nullptr, HWND hwnd = NULL) {
+        return SetInteractionState(active ? InteractionState::Active : InteractionState::Inactive, reason, eventSource, hwnd);
+    }
+
     bool SetInteractionState(InteractionState newState, const char* reason = nullptr, const char* eventSource = nullptr, HWND hwnd = NULL) {
         std::lock_guard<std::mutex> lock(m_mutex);
         const char* prevStr = StateToStr(m_interactionState);
         const char* newStr = StateToStr(newState);
-        const char* winRole = WindowRoleToStr(m_currentWindowRole);
         const char* panelStr = PanelToStr(m_activePanel);
 
         if (m_interactionState == newState) {
             // Guard: Idempotent - no repeated state churn
-            LogTransition(eventSource ? eventSource : "SetInteractionState",
-                          "InteractionStateChange", winRole, prevStr, newStr,
-                          m_appModeStr.c_str(), panelStr,
-                          "NoStateChange", reason ? reason : "AlreadyInTargetState");
+            LogTransitionInternal(eventSource ? eventSource : "SetInteractionState",
+                                  "InteractionStateChange", hwnd ? hwnd : m_focusedHwnd,
+                                  prevStr, newStr, panelStr, panelStr,
+                                  TargetToStr(m_logicalFocus), MouseRegionToStr(m_mouseRegion),
+                                  "NoStateChange", reason ? reason : "AlreadyInTargetState");
             return false;
         }
 
         m_interactionState = newState;
         std::string actionStr = std::string("StateTransition (") + prevStr + " -> " + newStr + ")";
-        LogTransition(eventSource ? eventSource : "SetInteractionState",
-                      "InteractionStateChange", winRole, prevStr, newStr,
-                      m_appModeStr.c_str(), panelStr,
-                      actionStr.c_str(), reason ? reason : "ExplicitRequest");
+        LogTransitionInternal(eventSource ? eventSource : "SetInteractionState",
+                              "InteractionStateChange", hwnd ? hwnd : m_focusedHwnd,
+                              prevStr, newStr, panelStr, panelStr,
+                              TargetToStr(m_logicalFocus), MouseRegionToStr(m_mouseRegion),
+                              actionStr.c_str(), reason ? reason : "ExplicitRequest");
+        return true;
+    }
+
+    // Mouse movement only updates MouseRegion:
+    // DOES NOT automatically activate or deactivate Hope!
+    bool SetMouseRegion(MouseRegion newRegion, const char* reason = nullptr, const char* eventSource = nullptr, HWND hwnd = NULL) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_mouseRegion == newRegion) return false;
+
+        MouseRegion prevRegion = m_mouseRegion;
+        m_mouseRegion = newRegion;
+        const char* panelStr = PanelToStr(m_activePanel);
+        const char* stateStr = StateToStr(m_interactionState);
+
+        std::string actStr = std::string("MouseRegion (") + MouseRegionToStr(prevRegion) + " -> " + MouseRegionToStr(newRegion) + ")";
+        // Region transition is idempotent and decoupled from application active state
+        LogTransitionInternal(eventSource ? eventSource : "SetMouseRegion",
+                              "MouseRegionChange", hwnd ? hwnd : m_focusedHwnd,
+                              stateStr, stateStr,
+                              panelStr, panelStr,
+                              TargetToStr(m_logicalFocus),
+                              MouseRegionToStr(newRegion),
+                              actStr.c_str(),
+                              reason ? reason : "PointerPositionChanged");
         return true;
     }
 
@@ -239,30 +311,52 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_inputMode == newMode) return false;
         m_inputMode = newMode;
-        LogTransition("SetInputMode", "InputModeChange", WindowRoleToStr(m_currentWindowRole),
-                      StateToStr(m_interactionState), StateToStr(m_interactionState),
-                      m_appModeStr.c_str(), PanelToStr(m_activePanel),
-                      ModeToStr(newMode), reason ? reason : "ModalityShift");
+        const char* panelStr = PanelToStr(m_activePanel);
+        const char* stateStr = StateToStr(m_interactionState);
+        LogTransitionInternal("SetInputMode", "InputModeChange", m_focusedHwnd,
+                              stateStr, stateStr,
+                              panelStr, panelStr,
+                              TargetToStr(m_logicalFocus),
+                              MouseRegionToStr(m_mouseRegion),
+                              ModeToStr(newMode), reason ? reason : "ModalityShift");
         return true;
     }
 
+    // Moving between Hope Region A -> Region B simply updates current region
+    // rather than performing deactivate -> activate -> focus -> deactivate -> activate.
     bool SetActivePanel(ActivePanel newPanel, const char* reason = nullptr) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_activePanel == newPanel) return false;
+
+        ActivePanel prev = m_activePanel;
         m_activePanel = newPanel;
-        LogTransition("SetActivePanel", "ActivePanelChange", WindowRoleToStr(m_currentWindowRole),
-                      StateToStr(m_interactionState), StateToStr(m_interactionState),
-                      m_appModeStr.c_str(), PanelToStr(newPanel),
-                      PanelToStr(newPanel), reason ? reason : "PanelSwitch");
+        const char* prevPanelStr = PanelToStr(prev);
+        const char* newPanelStr = PanelToStr(newPanel);
+        const char* stateStr = StateToStr(m_interactionState);
+
+        std::string actionStr = std::string("RegionTransition (") + prevPanelStr + " -> " + newPanelStr + ")";
+        LogTransitionInternal("SetActivePanel", "ActivePanelChange", m_focusedHwnd,
+                              stateStr, stateStr,
+                              prevPanelStr, newPanelStr,
+                              TargetToStr(m_logicalFocus),
+                              MouseRegionToStr(m_mouseRegion),
+                              actionStr.c_str(), reason ? reason : "RegionSwitch");
         return true;
+    }
+
+    bool SetCurrentRegion(ActivePanel newPanel, const char* reason = nullptr) {
+        return SetActivePanel(newPanel, reason);
     }
 
     bool SetLogicalFocus(LogicalFocusTarget newTarget, const char* reason = nullptr) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_logicalFocus == newTarget) return false;
+
         const char* prevTarget = TargetToStr(m_logicalFocus);
         m_logicalFocus = newTarget;
         const char* nextTarget = TargetToStr(newTarget);
+        const char* panelStr = PanelToStr(m_activePanel);
+        const char* stateStr = StateToStr(m_interactionState);
 
         // Keep legacy g_currentFocus in sync
         switch (newTarget) {
@@ -276,28 +370,75 @@ public:
         }
 
         std::string actionStr = std::string("FocusTarget (") + prevTarget + " -> " + nextTarget + ")";
-        LogTransition("SetLogicalFocus", "LogicalFocusChange", WindowRoleToStr(m_currentWindowRole),
-                      StateToStr(m_interactionState), StateToStr(m_interactionState),
-                      m_appModeStr.c_str(), PanelToStr(m_activePanel),
-                      actionStr.c_str(), reason ? reason : "NavigationTargetUpdated");
+        LogTransitionInternal("SetLogicalFocus", "LogicalFocusChange", m_focusedHwnd,
+                              stateStr, stateStr,
+                              panelStr, panelStr,
+                              nextTarget,
+                              MouseRegionToStr(m_mouseRegion),
+                              actionStr.c_str(), reason ? reason : "NavigationTargetUpdated");
         return true;
     }
 
     void SetWindowRole(WindowRole role, const char* reason = nullptr) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_currentWindowRole == role) return;
+
         const char* prevRole = WindowRoleToStr(m_currentWindowRole);
         m_currentWindowRole = role;
         const char* nextRole = WindowRoleToStr(role);
+        const char* panelStr = PanelToStr(m_activePanel);
+        const char* stateStr = StateToStr(m_interactionState);
+
         std::string act = std::string("WindowRole (") + prevRole + " -> " + nextRole + ")";
-        LogTransition("SetWindowRole", "WindowRoleChange", nextRole,
-                      StateToStr(m_interactionState), StateToStr(m_interactionState),
-                      m_appModeStr.c_str(), PanelToStr(m_activePanel),
-                      act.c_str(), reason ? reason : "RoleUpdate");
+        LogTransitionInternal("SetWindowRole", "WindowRoleChange", m_focusedHwnd,
+                              stateStr, stateStr,
+                              panelStr, panelStr,
+                              TargetToStr(m_logicalFocus),
+                              MouseRegionToStr(m_mouseRegion),
+                              act.c_str(), reason ? reason : "RoleUpdate");
     }
 
     void SetCurrentWindowRole(WindowRole role) {
         SetWindowRole(role);
+    }
+
+    void SetDualMode(bool active, const char* reason = nullptr) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_dualMode == active) return;
+        m_dualMode = active;
+        m_currentWindowRole = active ? WindowRole::Secondary : WindowRole::Primary;
+        m_activePanel = active ? ActivePanel::Secondary : ActivePanel::Primary;
+        const char* stateStr = StateToStr(m_interactionState);
+        LogTransitionInternal("SetDualMode", "DualModeToggled", m_focusedHwnd,
+                              stateStr, stateStr,
+                              active ? "Primary" : "Secondary",
+                              active ? "Secondary" : "Primary",
+                              TargetToStr(m_logicalFocus),
+                              MouseRegionToStr(m_mouseRegion),
+                              active ? "EnteredDualMode" : "ExitedDualMode",
+                              reason ? reason : "ModeToggle");
+    }
+
+    void SetWindowActivation(bool active, HWND hwnd = NULL, const char* reason = nullptr) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        WindowActivationState s = active ? WindowActivationState::Active : WindowActivationState::Inactive;
+        if (m_windowActivation == s && m_focusedHwnd == hwnd) return;
+        m_windowActivation = s;
+        m_focusedHwnd = active ? hwnd : NULL;
+        const char* panelStr = PanelToStr(m_activePanel);
+        const char* stateStr = StateToStr(m_interactionState);
+        LogTransitionInternal("SetWindowActivation", "WindowActivationChange", hwnd,
+                              stateStr, stateStr,
+                              panelStr, panelStr,
+                              TargetToStr(m_logicalFocus),
+                              MouseRegionToStr(m_mouseRegion),
+                              active ? "WindowActivated" : "WindowDeactivated",
+                              reason ? reason : "OsActivationChanged");
+    }
+
+    void SetVisibility(bool visible) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_isVisible = visible;
     }
 
     void SetAppModeStr(const std::string& modeStr) {
@@ -310,6 +451,16 @@ public:
         return m_interactionState;
     }
 
+    bool IsActive() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_interactionState == InteractionState::Active;
+    }
+
+    WindowActivationState GetWindowActivationState() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_windowActivation;
+    }
+
     InputMode GetInputMode() {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_inputMode;
@@ -318,6 +469,16 @@ public:
     ActivePanel GetActivePanel() {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_activePanel;
+    }
+
+    ActivePanel GetCurrentRegion() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_activePanel;
+    }
+
+    MouseRegion GetMouseRegion() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_mouseRegion;
     }
 
     LogicalFocusTarget GetLogicalFocus() {
@@ -330,14 +491,24 @@ public:
         return m_currentWindowRole;
     }
 
+    HWND GetFocusedWindow() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_focusedHwnd;
+    }
+
+    bool IsDualMode() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_dualMode;
+    }
+
+    bool IsVisible() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_isVisible;
+    }
+
     std::string GetAppModeStr() {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_appModeStr;
-    }
-
-    bool IsActive() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_interactionState == InteractionState::Active;
     }
 
     bool IsInputSwallowingAllowed() {
@@ -350,47 +521,108 @@ public:
                 m_logicalFocus == LogicalFocusTarget::BrowserUrl);
     }
 
-    // STEP 7: Event Normalization - interprets low-level OS messages into normalized state
+    // Interprets low-level OS messages into normalized state:
+    // Decoupled from automatic application activation/deactivation!
     void NormalizeOsEvent(UINT msg, WPARAM wParam, LPARAM lParam, const char* source = "WndProc") {
         NormalizeOsEvent(NULL, msg, wParam, lParam, source);
     }
 
     void NormalizeOsEvent(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, const char* source = "WndProc") {
-        const char* winRole = WindowRoleToStr(m_currentWindowRole);
+        std::lock_guard<std::mutex> lock(m_mutex);
         const char* panelStr = PanelToStr(m_activePanel);
+        const char* stateStr = StateToStr(m_interactionState);
 
         switch (msg) {
             case WM_MOUSEMOVE: {
-                // Moving pointer across window boundaries does NOT toggle application active state!
-                // It only informs input modality that mouse is in use.
                 m_inputMode = InputMode::Mouse;
-                // No state change logged for routine mouse move to prevent spam,
-                // but boundary transitions are cleanly ignored.
+                MouseRegion currentM = (m_currentWindowRole == WindowRole::Secondary) ? MouseRegion::Secondary : MouseRegion::Primary;
+                if (m_mouseRegion != currentM) {
+                    m_mouseRegion = currentM;
+                    LogTransitionInternal(source, "WM_MOUSEMOVE", hWnd,
+                                          stateStr, stateStr,
+                                          panelStr, panelStr,
+                                          TargetToStr(m_logicalFocus),
+                                          MouseRegionToStr(currentM),
+                                          "UpdateMouseRegionOnly", "CursorEnteredHopeWindow");
+                }
                 break;
             }
             case WM_MOUSELEAVE: {
-                // Pointer left Hope window bounds. This is NOT a deactivation!
-                LogTransition(source, "WM_MOUSELEAVE", winRole,
-                              StateToStr(m_interactionState), StateToStr(m_interactionState),
-                              m_appModeStr.c_str(), panelStr,
-                              "NoStateChange", "PointerMovedBetweenHopeRegions");
+                // Pointer left Hope window bounds. This is NOT a deactivation of the application!
+                m_mouseRegion = MouseRegion::Host;
+                LogTransitionInternal(source, "WM_MOUSELEAVE", hWnd,
+                                      stateStr, stateStr,
+                                      panelStr, panelStr,
+                                      TargetToStr(m_logicalFocus),
+                                      MouseRegionToStr(m_mouseRegion),
+                                      "UpdateMouseRegionOnly", "CursorMovedToHostWindow");
                 break;
             }
             case WM_SETFOCUS: {
-                // Legitimate OS focus received
-                SetInteractionState(InteractionState::Active, "OsWindowGainedFocus", source, hWnd);
+                m_focusedHwnd = hWnd;
+                m_windowActivation = WindowActivationState::Active;
+                LogTransitionInternal(source, "WM_SETFOCUS", hWnd,
+                                      stateStr, stateStr,
+                                      panelStr, panelStr,
+                                      TargetToStr(m_logicalFocus),
+                                      MouseRegionToStr(m_mouseRegion),
+                                      "WindowGainedOsFocus", "OsWindowGainedFocus");
                 break;
             }
             case WM_KILLFOCUS: {
-                // Legitimate OS focus lost
-                SetInteractionState(InteractionState::Inactive, "OsWindowLostFocus", source, hWnd);
+                if (m_focusedHwnd == hWnd) m_focusedHwnd = NULL;
+                m_windowActivation = WindowActivationState::Inactive;
+                LogTransitionInternal(source, "WM_KILLFOCUS", hWnd,
+                                      stateStr, stateStr,
+                                      panelStr, panelStr,
+                                      TargetToStr(m_logicalFocus),
+                                      MouseRegionToStr(m_mouseRegion),
+                                      "WindowLostOsFocus", "OsWindowLostFocus");
                 break;
             }
             case WM_ACTIVATE: {
-                if (LOWORD(wParam) == WA_INACTIVE) {
-                    SetInteractionState(InteractionState::Inactive, "OsActivateInactive", source, hWnd);
-                } else {
-                    SetInteractionState(InteractionState::Active, "OsActivateActive", source, hWnd);
+                bool isActivating = (LOWORD(wParam) != WA_INACTIVE);
+                m_windowActivation = isActivating ? WindowActivationState::Active : WindowActivationState::Inactive;
+                LogTransitionInternal(source, "WM_ACTIVATE", hWnd,
+                                      stateStr, stateStr,
+                                      panelStr, panelStr,
+                                      TargetToStr(m_logicalFocus),
+                                      MouseRegionToStr(m_mouseRegion),
+                                      isActivating ? "OsActivateActive" : "OsActivateInactive",
+                                      "OsWindowActivationMessage");
+                break;
+            }
+            case WM_MOUSEACTIVATE: {
+                LogTransitionInternal(source, "WM_MOUSEACTIVATE", hWnd,
+                                      stateStr, stateStr,
+                                      panelStr, panelStr,
+                                      TargetToStr(m_logicalFocus),
+                                      MouseRegionToStr(m_mouseRegion),
+                                      "NoStateChange", "FocuslessOverlaySwallowsMouseActivate");
+                break;
+            }
+            case WM_NCACTIVATE: {
+                LogTransitionInternal(source, "WM_NCACTIVATE", hWnd,
+                                      stateStr, stateStr,
+                                      panelStr, panelStr,
+                                      TargetToStr(m_logicalFocus),
+                                      MouseRegionToStr(m_mouseRegion),
+                                      "NoStateChange", "NonClientActivationIntercepted");
+                break;
+            }
+            case WM_LBUTTONDOWN:
+            case WM_RBUTTONDOWN:
+            case WM_MBUTTONDOWN: {
+                m_inputMode = InputMode::Mouse;
+                m_mouseRegion = (m_currentWindowRole == WindowRole::Secondary) ? MouseRegion::Secondary : MouseRegion::Primary;
+                if (m_interactionState != InteractionState::Active) {
+                    m_interactionState = InteractionState::Active;
+                    LogTransitionInternal(source, "WM_LBUTTONDOWN", hWnd,
+                                          "Inactive", "Active",
+                                          panelStr, panelStr,
+                                          TargetToStr(m_logicalFocus),
+                                          MouseRegionToStr(m_mouseRegion),
+                                          "StateTransition (Inactive -> Active)", "UserClickedHopeUi");
                 }
                 break;
             }
