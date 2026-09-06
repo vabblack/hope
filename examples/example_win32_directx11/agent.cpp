@@ -1,6 +1,8 @@
+#define IMGUI_DEFINE_MATH_OPERATORS
 #include "agent.h"
 #include "ai_types.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "nlohmann/json.hpp"
 #include "ui_state.h"
 #include "oauth_state.h"
@@ -55,7 +57,7 @@ namespace Api {
 }
 
 float CalculateInputBoxHeight(const std::string& buf, float availableWidth);
-bool FloatingInputGhost(const char* id, const char* label, std::string& buf, FocusState myFocus, bool showSendButton, bool& outSendClicked, float fixedHeight = 0.0f);
+bool FloatingInputGhost(const char* id, const char* label, std::string& buf, FocusState myFocus, bool showSendButton, bool& outSendClicked, float fixedHeight = 0.0f, bool isPassword = false);
 
 namespace Api {
     void FetchModelsForProvider(AIProvider type);
@@ -3280,13 +3282,23 @@ void RenderProcessSelector(const ImVec4& accentColor) {
     if (!g_showProcessSelector) return;
 
     ImGui::OpenPopup("Select Process");
-    ImGui::SetNextWindowSize(ImVec2(450, 450), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(480, 480), ImGuiCond_FirstUseEver);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.07f, 0.08f, 0.12f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_Border, accentColor);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 14.0f));
+
     if (ImGui::BeginPopupModal("Select Process", &g_showProcessSelector)) {
-        ImGui::TextColored(accentColor, "SELECT TARGET PROCESS");
+        ImGui::TextColored(accentColor, "✦ SELECT TARGET PROCESS TO ATTACH");
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(accentColor.x, accentColor.y, accentColor.z, 0.35f));
         ImGui::Separator();
+        ImGui::PopStyleColor();
         ImGui::Spacing();
 
-        if (ImGui::BeginChild("ProcList", ImVec2(0, -40), true)) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.06f, 0.09f, 0.95f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+        if (ImGui::BeginChild("ProcList", ImVec2(0, -46), true)) {
             auto list = GetProcessListSnapshot();
             for (const auto& proc : list) {
                 char label[512];
@@ -3299,17 +3311,27 @@ void RenderProcessSelector(const ImVec4& accentColor) {
             }
             ImGui::EndChild();
         }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
 
-        if (ImGui::Button("REFRESH", ImVec2(100, 30))) {
+        ImGui::Spacing();
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.20f, 0.28f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accentColor.x * 0.8f, accentColor.y * 0.8f, accentColor.z * 0.8f, 0.9f));
+        if (ImGui::Button("REFRESH LIST", ImVec2(120, 30))) {
             RefreshProcessList();
         }
         ImGui::SameLine();
-        if (ImGui::Button("CLOSE", ImVec2(100, 30))) {
+        if (ImGui::Button("CLOSE", ImVec2(90, 30))) {
             g_showProcessSelector = false;
         }
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
 
         ImGui::EndPopup();
     }
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
 }
 
 
@@ -3377,31 +3399,90 @@ void RenderPage(const ImVec4& accentColor) {
     CleanupFinishedSubAgents();
     RenderProcessSelector(accentColor);
 
-    ImGui::TextColored(accentColor, "AUTONOMOUS AGENT");
-    ImGui::SameLine();
-    ImGui::TextDisabled("(Beta) | Workers: %d", CountRunningSubAgents());
+    auto GetColorU32 = [](const ImVec4& c, float alphaMul = 1.0f) -> ImU32 {
+        return IM_COL32((int)(c.x * 255.0f), (int)(c.y * 255.0f), (int)(c.z * 255.0f), (int)(c.w * 255.0f * alphaMul));
+    };
 
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
-    if (ImGui::Button(g_targetWindow ? "Change App" : "Attach App")) {
+    // --- AGENT STATUS SNAPSHOT ---
+    std::vector<AgentStepLog> logSnapshot;
+    std::string statusSnapshot;
+    bool runningSnapshot = false;
+    bool pausedSnapshot = false;
+    int workerSnapshot = CountRunningSubAgents();
+    {
+        std::lock_guard<std::mutex> lock(g_agentMutex);
+        logSnapshot = g_agent.executionLog;
+        statusSnapshot = g_agent.statusMessage;
+        runningSnapshot = g_agent.isRunning || workerSnapshot > 0;
+        pausedSnapshot = g_agent.isPaused;
+    }
+    if (workerSnapshot > 0) {
+        statusSnapshot += " | Workers: " + std::to_string(workerSnapshot);
+    }
+
+    // --- TOP AGENT HEADER GLASS CARD ---
+    float headerW = ImGui::GetContentRegionAvail().x;
+    float headerH = 46.0f;
+    ImVec2 headerMin = ImGui::GetCursorScreenPos();
+    ImVec2 headerMax = headerMin + ImVec2(headerW, headerH);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    float curSec = (float)GetTickCount64() / 1000.0f;
+    float pulse = 0.5f + 0.5f * sinf(curSec * (runningSnapshot ? 5.0f : 2.5f));
+
+    dl->AddRectFilled(headerMin, headerMax, IM_COL32(14, 18, 26, 240), 10.0f);
+    dl->AddRect(headerMin, headerMax, GetColorU32(accentColor, 0.40f), 10.0f, 0, 1.2f);
+
+    // Glowing Agent Orb
+    ImVec2 orbPos = headerMin + ImVec2(18.0f, headerH * 0.5f);
+    ImU32 orbCol = runningSnapshot ? IM_COL32(40, 240, 110, 255) : GetColorU32(accentColor, 0.95f);
+    dl->AddCircle(orbPos, 7.0f + 2.0f * pulse, GetColorU32(accentColor, 0.35f), 16, 1.2f);
+    dl->AddCircleFilled(orbPos, 4.0f, orbCol, 16);
+
+    ImGui::SetCursorScreenPos(headerMin + ImVec2(34.0f, 6.0f));
+    ImGui::TextColored(accentColor, "AUTONOMOUS AGENT");
+    ImGui::SameLine(0.0f, 8.0f);
+
+    if (runningSnapshot) {
+        ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.55f, 1.0f), "[ACTIVE]");
+    } else if (pausedSnapshot) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "[PAUSED]");
+    } else {
+        ImGui::TextDisabled("[READY]");
+    }
+
+    ImGui::SetCursorScreenPos(headerMin + ImVec2(34.0f, 24.0f));
+    if (g_targetWindow) {
+        ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f), "Target: %s", g_targetProcessName.c_str());
+    } else {
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.45f, 1.0f), "Target: None (Click Attach)");
+    }
+
+    // Attach App Button (Top Right)
+    float attachBtnW = 100.0f;
+    ImGui::SetCursorScreenPos(headerMin + ImVec2(headerW - attachBtnW - 8.0f, 9.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.20f, 0.28f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accentColor.x * 0.8f, accentColor.y * 0.8f, accentColor.z * 0.8f, 0.9f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.94f, 0.98f, 1.0f));
+    if (ImGui::Button(g_targetWindow ? "Switch App" : "Attach App", ImVec2(attachBtnW, 28.0f))) {
         RefreshProcessList();
         g_showProcessSelector = true;
     }
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
 
-    if (g_targetWindow) {
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Target: %s", g_targetProcessName.c_str());
-    }
-    else {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Target: None");
-    }
-    int workerCount = CountRunningSubAgents();
-    if (workerCount > 0) {
-        ImGui::TextDisabled("Parallel workers active: %d", workerCount);
-    }
+    ImGui::SetCursorScreenPos(headerMin + ImVec2(0.0f, headerH + 8.0f));
 
-    ImGui::Spacing();
+    // --- PROVIDER / MODEL SELECTOR DOCK ---
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.09f, 0.11f, 0.15f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.14f, 0.17f, 0.23f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.18f, 0.22f, 0.30f, 1.0f));
+
     if (!g_providers.empty()) {
         if (g_currProviderIdx >= (int)g_providers.size()) g_currProviderIdx = 0;
-        ImGui::PushItemWidth(160.0f);
+        ImGui::PushItemWidth(140.0f);
         const char* currentProvName = g_providers[g_currProviderIdx].name.c_str();
         if (ImGui::BeginCombo("##prov_sel_ag", currentProvName)) {
             for (int n = 0; n < (int)g_providers.size(); n++) {
@@ -3417,7 +3498,7 @@ void RenderPage(const ImVec4& accentColor) {
             }
             ImGui::EndCombo();
         }
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, 6.0f);
 
         auto& currentProv = g_providers[g_currProviderIdx];
         std::string currentModelName = "Loading...";
@@ -3447,45 +3528,67 @@ void RenderPage(const ImVec4& accentColor) {
         ImGui::TextDisabled("No providers configured.");
     }
 
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
+
+    ImGui::PushStyleColor(ImGuiCol_Separator, GetColorU32(accentColor, 0.35f));
     ImGui::Separator();
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
 
-    float footerHeight = 130.0f;
+    // --- AGENT ACTIVITY LOG (SCROLLABLE CHILD) ---
+    float footerHeight = 115.0f;
     ImGui::BeginChild("AgentLog", ImVec2(0.0f, ImGui::GetContentRegionAvail().y - footerHeight), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
-
-    std::vector<AgentStepLog> logSnapshot;
-    std::string statusSnapshot;
-    bool runningSnapshot = false;
-    bool pausedSnapshot = false;
-    int workerSnapshot = CountRunningSubAgents();
-    {
-        std::lock_guard<std::mutex> lock(g_agentMutex);
-        logSnapshot = g_agent.executionLog;
-        statusSnapshot = g_agent.statusMessage;
-        runningSnapshot = g_agent.isRunning || workerSnapshot > 0;
-        pausedSnapshot = g_agent.isPaused;
-    }
-    if (workerSnapshot > 0) {
-        statusSnapshot += " | Workers: " + std::to_string(workerSnapshot);
-    }
 
     if (logSnapshot.empty() && !runningSnapshot) {
         ImGui::Spacing();
-        ImGui::TextDisabled("No agent activity yet.");
-        ImGui::TextDisabled("Attach a target app, type a goal, and press Start.");
+        ImGui::Dummy(ImVec2(0.0f, 20.0f));
+        float availW = ImGui::GetContentRegionAvail().x;
+        const char* empty1 = "✦ AUTONOMOUS COGNITIVE AGENT";
+        const char* empty2 = "Attach a target application, type your objective below, and press Start.";
+        float e1W = ImGui::CalcTextSize(empty1).x;
+        float e2W = ImGui::CalcTextSize(empty2).x;
+        ImGui::SetCursorPosX(ImMax(0.0f, (availW - e1W) * 0.5f));
+        ImGui::TextColored(accentColor, "%s", empty1);
+        ImGui::SetCursorPosX(ImMax(0.0f, (availW - e2W) * 0.5f));
+        ImGui::TextDisabled("%s", empty2);
+
         if (!statusSnapshot.empty() && statusSnapshot != "Idle") {
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(1, 1, 0, 1), "Status: %s", statusSnapshot.c_str());
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Status: %s", statusSnapshot.c_str());
         }
     }
     else {
         for (const auto& step : logSnapshot) {
-            ImGui::Separator();
-            ImGui::Text("Step %d", step.step);
-            if (!step.goal.empty()) ImGui::TextWrapped("Goal: %s", step.goal.c_str());
-            if (!step.reasoning.empty()) ImGui::TextWrapped("Reasoning: %s", step.reasoning.c_str());
-            if (!step.error.empty()) ImGui::TextWrapped("Error: %s", step.error.c_str());
-            ImGui::TextColored(step.success ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
-                step.success ? "Success" : "Failed");
+            // Render each step as a rounded obsidian card
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(16, 20, 28, 240));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
+
+            char stepChildId[64];
+            sprintf(stepChildId, "StepCard_%d", step.step);
+            float cardStepH = (!step.error.empty()) ? 110.0f : 85.0f;
+            if (ImGui::BeginChild(stepChildId, ImVec2(0.0f, cardStepH), true, ImGuiWindowFlags_NoScrollbar)) {
+                // Header: Step # and status
+                ImGui::TextColored(accentColor, "Step %d", step.step);
+                ImGui::SameLine();
+                ImGui::TextColored(step.success ? ImVec4(0.4f, 1.0f, 0.45f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                    step.success ? "✓ Success" : "✕ Failed");
+
+                if (!step.goal.empty()) {
+                    ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.95f, 1.0f), "Goal: %s", step.goal.c_str());
+                }
+                if (!step.reasoning.empty()) {
+                    ImGui::TextDisabled("Reasoning: %s", step.reasoning.c_str());
+                }
+                if (!step.error.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Error: %s", step.error.c_str());
+                }
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
         }
         if (runningSnapshot) {
             ImGui::Separator();
@@ -3495,28 +3598,49 @@ void RenderPage(const ImVec4& accentColor) {
 
     ImGui::EndChild();
 
+    // --- FOOTER CONTROLS ---
     ImGui::Spacing();
     bool sendClicked = false;
     float inputAreaHeight = CalculateInputBoxHeight(g_chatBuffer, ImGui::GetContentRegionAvail().x);
-    FloatingInputGhost("agent_goal", "Enter goal...", g_chatBuffer, FocusState::Chat, true, sendClicked, inputAreaHeight);
+    FloatingInputGhost("agent_goal", "Enter goal for autonomous agent...", g_chatBuffer, FocusState::Chat, true, sendClicked, inputAreaHeight);
 
     bool startClicked = sendClicked;
+    ImGui::Spacing();
     if (!runningSnapshot) {
-        if (ImGui::Button("Start", ImVec2(120, 0))) startClicked = true;
+        ImGui::PushStyleColor(ImGuiCol_Button, GetColorU32(accentColor, 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GetColorU32(accentColor, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+        if (ImGui::Button("START AGENT", ImVec2(130.0f, 32.0f))) startClicked = true;
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
     }
     else {
-        if (ImGui::Button("Stop", ImVec2(120, 0))) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.25f, 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.25f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+        if (ImGui::Button("STOP AGENT", ImVec2(130.0f, 32.0f))) {
             g_agent.Stop();
             StopAllSubAgents();
         }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
+
         if (g_agent.isRunning) {
-            ImGui::SameLine();
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.65f, 0.15f, 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.75f, 0.20f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
             if (pausedSnapshot) {
-                if (ImGui::Button("Resume", ImVec2(120, 0))) g_agent.Resume();
+                if (ImGui::Button("RESUME", ImVec2(100.0f, 32.0f))) g_agent.Resume();
             }
             else {
-                if (ImGui::Button("Pause", ImVec2(120, 0))) g_agent.Pause();
+                if (ImGui::Button("PAUSE", ImVec2(100.0f, 32.0f))) g_agent.Pause();
             }
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
         }
     }
 

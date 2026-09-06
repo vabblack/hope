@@ -19,5 +19,25 @@
         "ctrl": false,
         "shift": false,
         "vk": 191
+    },
+    "autoType": {
+        "alt": true,
+        "charDelay": 32,
+        "codeOnly": true,
+        "ctrl": false,
+        "naturalPauses": true,
+        "shift": false,
+        "smartIndent": true,
+        "speedPreset": 1,
+        "tokenBursts": true,
+        "typoRate": 1.5,
+        "typosEnabled": true,
+        "vk": 84
+    },
+    "autoTypeCodeOnly": {
+        "alt": true,
+        "ctrl": true,
+        "shift": false,
+        "vk": 84
     }
 }

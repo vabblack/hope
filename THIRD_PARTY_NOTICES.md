@@ -1,7 +1,7 @@
 # Third-party notices
-
-The personal non-commercial license in `LICENSE` applies only to original
-material authored by SunnyCOdet. The repository also contains third-party
+e personal non-commercial license in `LICENSE` applies only to original
+materi
+Thal authored by SunnyCOdet. The repository also contains third-party
 software and assets that remain under their own terms.
 
 ## Dear ImGui
