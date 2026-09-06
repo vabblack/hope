@@ -364,6 +364,7 @@ static std::string g_browserTypeBuffer = "";
 static bool g_browserInitFailed = false;
 static int g_browserInitRetries = 0;
 static std::string g_browserInitError = "";
+static bool g_useFallbackUserDataDir = false;
 
 // --- BROWSER PROXY THREAD STATE ---
 #include <mutex>
@@ -6207,7 +6208,16 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             QueueSwapchainResize((UINT)(rc.right - rc.left), (UINT)(rc.bottom - rc.top));
         return 0;
     }
-    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (msg == WM_DESTROY) {
+        if (g_webviewController) {
+            g_webviewController->Close();
+            g_webviewController = nullptr;
+        }
+        g_webview = nullptr;
+        g_webviewEnv = nullptr;
+        PostQuitMessage(0);
+        return 0;
+    }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
@@ -6677,10 +6687,16 @@ void InitBrowserMode() {
     std::string appData = GetAppDataPath();
     std::wstring userDataDir = L"";
     if (!appData.empty()) {
-        userDataDir = s2ws(appData + "\\ofradr\\browser_data_" + deskSuffix);
+        std::string baseDir = appData + "\\ofradr";
+        CreateDirectoryA(baseDir.c_str(), NULL);
+        std::string folderName = "\\browser_data_" + deskSuffix;
+        if (g_useFallbackUserDataDir) {
+            folderName += "_" + std::to_string(GetCurrentProcessId());
+        }
+        userDataDir = s2ws(baseDir + folderName);
     }
     BrowserLog("  AppData path = " + appData);
-    BrowserLog("  UserDataDir = " + (appData.empty() ? "(empty)" : appData + "\\ofradr\\browser_data_" + deskSuffix));
+    BrowserLog("  UserDataDir = " + (appData.empty() ? "(empty)" : ws2s(userDataDir)));
 
     // Pass arguments to bypass sandbox restrictions in custom/kiosk desktops like SafeExamBrowser
     SetEnvironmentVariableW(L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", L"--no-sandbox --disable-gpu-sandbox --disable-features=msWebView2BrowserHitTransparent");
@@ -6701,16 +6717,27 @@ void InitBrowserMode() {
                     BrowserLog("    -> System Error Desc: " + GetHResultDescription(result));
                     if (result == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
                         BrowserLog("    -> WebView2 Runtime NOT INSTALLED");
-                        g_browserInitError = "WebView2 Runtime is not installed.";
+                        g_browserInitError = "WebView2 Runtime is not installed. Please install the Microsoft Edge WebView2 Runtime.";
                         g_browserInitFailed = true;
-                    } else if (result == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS)) {
+                    } else if (result == HRESULT_FROM_WIN32(ERROR_FILE_EXISTS) || result == 0x80070050) {
                         BrowserLog("    -> User data folder LOCKED by another process");
+                        if (!g_useFallbackUserDataDir) {
+                            g_useFallbackUserDataDir = true;
+                            g_browserInitializing = false;
+                            return result; // Next attempt will use process-isolated directory
+                        } else {
+                            g_browserInitError = "Browser data folder is locked by another running instance of hope.exe. Please close other instances.";
+                            g_browserInitFailed = true;
+                        }
                     } else if (result == E_ACCESSDENIED) {
                         BrowserLog("    -> ACCESS DENIED (permissions issue)");
                         g_browserInitError = "Access denied when creating browser environment.";
                         g_browserInitFailed = true;
                     } else if (result == HRESULT_FROM_WIN32(ERROR_INVALID_STATE)) {
                         BrowserLog("    -> INVALID STATE (environment already exists?)");
+                        g_browserInitError = "Invalid browser state.";
+                    } else {
+                        g_browserInitError = "WebView2 error: " + GetHResultDescription(result);
                     }
                     g_browserInitializing = false;
                     return result;
@@ -6853,6 +6880,12 @@ void InitBrowserMode() {
     })());
     if (FAILED(hrCreate)) {
         BrowserLog("  IMMEDIATE FAILURE from CreateCoreWebView2EnvironmentWithOptions!");
+        if (hrCreate == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
+            g_browserInitError = "WebView2Loader.dll or WebView2 Runtime was not found.";
+            g_browserInitFailed = true;
+        } else {
+            g_browserInitError = "WebView2 initialization failed: " + GetHResultDescription(hrCreate);
+        }
         g_browserInitializing = false;
     }
 }
@@ -7128,6 +7161,7 @@ void RenderBrowserPage() {
             g_browserInitFailed = false;
             g_browserInitRetries = 0;
             g_browserInitError.clear();
+            g_useFallbackUserDataDir = true;
             BrowserLog("User clicked RETRY");
         }
         ImGui::PopStyleVar();
