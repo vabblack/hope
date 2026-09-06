@@ -67,6 +67,7 @@
 
 // Forward declarations for helper functions
 void MakeWindowAlwaysOnTop();
+void ForceTopMost();
 void InjectIntoBrowser();
 void on_click(int x, int y, bool pressed);
 
@@ -525,13 +526,7 @@ inline void SafeSetForegroundWindow(HWND target) {
 
 // ====================== MAKE WINDOW ALWAYS ON TOP ======================
 void MakeWindowAlwaysOnTop() {
-    if (g_hwnd && IsWindow(g_hwnd)) {
-        // Only set topmost if not already the top window in z-order
-        HWND prev = GetWindow(g_hwnd, GW_HWNDPREV);
-        if (prev != NULL) {
-            SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-        }
-    }
+    ForceTopMost();
 }
 
 // ====================== CLICK HANDLER WITH MAKE ON TOP ======================
@@ -3042,23 +3037,15 @@ static bool PresentFrame() {
 // =========================================================
 
 void ForceTopMost() {
-    if (g_isVisible && g_hwnd && IsWindow(g_hwnd)) {
-        static ULONGLONG lastCheck = 0;
-        ULONGLONG now = GetTickCount64();
-        // Check periodically and only if Z-order was lost, avoiding 60Hz message queue flooding
-        if (now - lastCheck > 1000) {
-            lastCheck = now;
-            HWND prev = GetWindow(g_hwnd, GW_HWNDPREV);
-            if (prev != NULL) {
-                SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-            }
-        }
-    }
+    if (!g_isVisible || !g_hwnd || !IsWindow(g_hwnd)) return;
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }
 
 // Forward declaration — ShutdownBrowserMode and BrowserLog are defined later
 void ShutdownBrowserMode();
 void BrowserLog(const std::string& msg);
+
+#define EXIT_DESKTOP_JUMP 0xDE5C
 
 void CheckDesktopJump() {
     EnforceCyberLLMGuardrails();
@@ -3070,13 +3057,16 @@ void CheckDesktopJump() {
             std::wstring b(n / sizeof(wchar_t), 0); GetUserObjectInformationW(h, UOI_NAME, &b[0], n, &n);
             while (!b.empty() && b.back() == L'\0') b.pop_back();
             return b;
-            };
-        // Keep desktop names alive until CreateProcessW finishes
+        };
         std::wstring nameI = GetN(hI);
         std::wstring nameM = GetN(hM);
-        if (_wcsicmp(nameI.c_str(), nameM.c_str()) != 0) {
-            // Clean up WebView2 before re-launching so the new process can
-            // acquire the browser_data directory lock and init properly
+        if (!nameI.empty() && !nameM.empty() && _wcsicmp(nameI.c_str(), nameM.c_str()) != 0) {
+            // Do not jump to lock screen or screensaver
+            if (_wcsicmp(nameI.c_str(), L"Winlogon") == 0 || _wcsicmp(nameI.c_str(), L"Screen-saver") == 0) {
+                CloseDesktop(hI);
+                return;
+            }
+
             ShutdownBrowserMode();
 
             WCHAR p[MAX_PATH]; GetModuleFileNameW(NULL, p, MAX_PATH);
@@ -3085,9 +3075,20 @@ void CheckDesktopJump() {
             PROCESS_INFORMATION pi{};
             if (CreateProcessW(p, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
                 BrowserLog("CheckDesktopJump: Jumped from " + ws2s(nameM) + " to " + ws2s(nameI) + ", shutting down current instance.");
+                
+                // Write child PID to shared memory for watchdog adoption
+                HANDLE hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(DWORD), L"Local\\Watchdog_JumpPid");
+                if (hMap) {
+                    DWORD* pPid = (DWORD*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DWORD));
+                    if (pPid) {
+                        *pPid = pi.dwProcessId;
+                        UnmapViewOfFile(pPid);
+                    }
+                }
+
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
-                ExitProcess(0);
+                ExitProcess(EXIT_DESKTOP_JUMP);
             }
         }
     }
@@ -6217,6 +6218,13 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) {
         return true;
     }
+    // Prevent accidental forced close via Alt+F4 or window close actions:
+    // Hides the overlay and keeps the application alive in the background
+    if (msg == WM_CLOSE || (msg == WM_SYSCOMMAND && (wParam & 0xFFF0) == SC_CLOSE)) {
+        ShowWindow(hWnd, SW_HIDE);
+        g_isVisible = false;
+        return 0;
+    }
     if (msg == WM_USER + 1) { CaptureScreenshot(); return 0; }
     if (msg == WM_USER + 2) {
         g_pendingInspectionText.clear();
@@ -8239,6 +8247,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // =========================================================================
     EnforceCyberLLMGuardrails();
 
+    RegisterApplicationRestart(L"--restarted", 0);
+
     SetProcessDPIAware();
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     AntiDebug::HideCurrentThread();
@@ -8246,11 +8256,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // --- AUTO-DOWNLOAD WEBVIEW2LOADER.DLL IF MISSING ---
     EnsureWebView2LoaderDll();
-    // ---------------------------------------------------
 
     // --- ACTIVATE STEALTH MODE ---
     std::thread(RunStealthMode).detach();
-    // -----------------------------
 
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
 
@@ -8259,7 +8267,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // --- LOAD SAVED HOTKEYS ON STARTUP ---
     LoadHotkeys();
     if (g_interviewModelPath.empty()) g_interviewModelPath = GetDefaultInterviewModelPath();
-    // -------------------------------------
 
     RemoveHttpDebug();
 
@@ -8268,7 +8275,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // --- LOAD SAVED OAUTH ON STARTUP ---
     LoadOAuth();
-    // ----------------------------------
 
     g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, HookProc, GetModuleHandle(NULL), 0);
     static ULONGLONG lastHookCheck = GetTickCount64();
@@ -8290,29 +8296,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     int posY = (screenH - winH) / 2;
 
     // --- STEALTH: Hidden owner window to bypass .NET Process.MainWindowHandle detection ---
-    // .NET checks: GetWindow(hwnd, GW_OWNER) == IntPtr.Zero && IsWindowVisible(hwnd)
-    // By giving our window a hidden owner, GetWindow returns non-null => MainWindowHandle stays IntPtr.Zero
     HWND hiddenOwner = CreateWindowExW(0, g_randomClassName.c_str(), L"",
         WS_POPUP, 0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
 
-    // Use random string for Class Name, but EMPTY STRING for Window Title
-    // This makes it invisible to simple enumeration by Installers.
-    // WS_EX_TOOLWINDOW removed: hiddenOwner already prevents taskbar/alt-tab visibility
-    // Removing it breaks the 4-flag combo detection (TOPMOST+LAYERED+TOOLWINDOW+NOACTIVATE)
     g_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         g_randomClassName.c_str(), L"", WS_POPUP | WS_THICKFRAME,
         posX, posY, winW, winH, hiddenOwner, NULL, wc.hInstance, NULL);
 
-    // Ensure the window stays on top
-    MakeWindowAlwaysOnTop();
-
-
     SetLayeredWindowAttributes(g_hwnd, 0, 255, LWA_ALPHA);
-    SetWindowDisplayAffinity(g_hwnd, 0x00000011); // TEMP: Disabled for video recording
+    SetWindowDisplayAffinity(g_hwnd, 0x00000011);
 
     if (!CreateDeviceD3D(g_hwnd))
         return 1;
+
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     Agent::Init(g_hwnd);
     if (Agent::IsTelegramEnabled()) {
@@ -8658,39 +8656,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         UpdateInterviewModeAutoState();
         PumpInterviewCompletedQueue();
 
-        // Overlay watchdog: if hidden for >5 seconds, make it visible again
-        static auto lastOverlayVisibleTime = std::chrono::steady_clock::now();
+        // When overlay is hidden, sleep to conserve CPU and wait for hotkey toggle
         if (!g_isVisible) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - lastOverlayVisibleTime > std::chrono::seconds(5)) {
-                g_isVisible = true;
-                ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-                lastOverlayVisibleTime = now;
-            }
             Sleep(50);
             continue;
-        } else {
-            lastOverlayVisibleTime = std::chrono::steady_clock::now();
         }
 
-        if (g_SwapChainOccluded && g_pSwapChain) {
-            HRESULT occludedHr = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
-            if (occludedHr == DXGI_STATUS_OCCLUDED) {
-                Sleep(10);
-                continue;
-            }
-            if (occludedHr == DXGI_ERROR_DEVICE_REMOVED || occludedHr == DXGI_ERROR_DEVICE_RESET) {
-                g_NeedDeviceReset = true;
-                continue;
-            }
-            g_SwapChainOccluded = false;
-        }
+        // Keep overlay on top of any and all applications at all times without stealing focus
+        ForceTopMost();
+
         if (!g_pd3dDevice || !g_pd3dDeviceContext || !g_pSwapChain || !g_mainRenderTargetView) {
             Sleep(10);
             continue;
         }
-
-        ForceTopMost();
 
         // --- APPLY TRANSPARENCY ---
         if (g_duelModeActive && g_appState == AppState::LoggedIn) {

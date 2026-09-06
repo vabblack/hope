@@ -27,8 +27,13 @@ gemini.txt
 ## Excluded script and CI file types
 *.py
 *.ps1
+!examples/example_win32_directx11/sign_binaries.ps1
 *.yml
 *.yaml
+*.bak
+*.zip
+app_hook.dll
+**/app_hook.dll
 ## Visual Studio artifacts
 .vs
 ipch

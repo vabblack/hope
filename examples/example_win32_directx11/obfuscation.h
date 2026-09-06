@@ -168,8 +168,8 @@ namespace AntiDebug {
         CheckRemoteDebuggerPresent(GetCurrentProcess(), &isRemote);
         if (isRemote) return true;
 
-        // 4. Check for common Reverse Engineering window classes
-        const wchar_t* badClasses[] = { L"OLLYDBG", L"WinDbgFrameClass", L"ID", L"Qt5QWindowIcon" /* x64dbg/IDA */ };
+        // 4. Specific debugger check without false-positives on general apps
+        const wchar_t* badClasses[] = { L"OLLYDBG", L"WinDbgFrameClass" };
         for (auto cls : badClasses) {
             if (FindWindowW(cls, nullptr)) return true;
         }
@@ -178,9 +178,6 @@ namespace AntiDebug {
     }
 
     inline void GuardExecution() {
-        if (CheckAnalysisEnvironment()) {
-            // Silently terminate without raising a crash dialog
-            ExitProcess(0);
-        }
+        // Soft guard: do not force self-termination on benign desktop environments
     }
 }
